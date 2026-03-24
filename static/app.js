@@ -15,6 +15,8 @@ async function sendCommand(endpoint, params = {}) {
     const urlParams = new URLSearchParams({ room: currentRoom, ...params });
     try {
         const response = await fetch(`/${endpoint}?${urlParams.toString()}`);
+
+        console.log(`/${endpoint}?${urlParams.toString()}`);
         return await response.text();
     } catch (e) { return null; }
 }
