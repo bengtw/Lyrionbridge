@@ -10,6 +10,7 @@ app = Flask(__name__)
 # --- KONFIGURATION ---
 LMS_URL = "http://127.0.0.1:9000/jsonrpc.js"
 C5_IP = "10.0.1.125" 
+LINN_IP = "10.0.1.130"
 
 # Dina definierade rum
 PLAYERS = {
@@ -19,6 +20,25 @@ PLAYERS = {
 }
 
 # --- HJÄLPFUNKTIONER ---
+def force_linn_stop():
+    # Testa port 80 för "UPnP AV" eller 4100 för "OpenHome"
+    url = f"http://{LINN_IP}:80/ds/av/control" 
+    headers = {
+        'Content-Type': 'text/xml; charset="utf-8"',
+        'SOAPACTION': '"urn:schemas-upnp-org:service:AVTransport:1#Stop"'
+    }
+    body = """<?xml version="1.0" encoding="utf-8"?>
+    <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+        <s:Body>
+            <u:Stop xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+                <InstanceID>0</InstanceID>
+            </u:Stop>
+        </s:Body>
+    </s:Envelope>"""
+    try:
+        requests.post(url, data=body, headers=headers, timeout=1)
+    except Exception as e:
+        print(f"[LINN ERROR] {e}")
 
 def lms_json_rpc(player_id, command_args):
     """Kommunicerar med Logitech Media Server via JSON-RPC"""
@@ -194,9 +214,22 @@ def get_title():
 
 @app.route('/pause')
 def pause_music():
-    player_mac, _ = get_player_info(request.args.get('room'))
+    room_id = request.args.get('room')
+    player_mac, room_name = get_player_info(room_id)
+    
+    # Debug-utskrift så du ser i loggen att den hittar rätt
+    print(f"[PAUSE] Rum: {room_id}, Namn i Lyrion: {room_name}")
+
     if player_mac:
+        # 1. Standardpaus till Lyrion (LMS)
         lms_json_rpc(player_mac, ["pause"])
+        
+        # 2. Den "smarta" matchningen för Linn
+        # Vi gör om namnet till små bokstäver och kollar om "linn" finns med
+        if room_name and "linn" in room_name.lower():
+            print(f"[ACTION] Linn detekterad ({room_name}). Skickar direkt-stopp till {LINN_IP}...")
+            force_linn_stop()
+            
         return "OK"
     return "Error", 404
 
