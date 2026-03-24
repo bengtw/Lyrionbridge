@@ -11,13 +11,27 @@ app = Flask(__name__)
 LMS_URL = "http://127.0.0.1:9000/jsonrpc.js"
 C5_IP = "10.0.1.125" 
 
-
 # Dina definierade rum
 PLAYERS = {
     "office": "b8:27:eb:fb:30:d9", 
     "linn": "bb:bb:4d:b0:d0:06",      
     "c5": "bb:bb:7a:f8:33:39"
 }
+
+# --- DATA: SPELLISTOR ---
+# En enda "sanning" för alla dina spellistor (DRY - Don't Repeat Yourself)
+FAVORITE_PLAYLISTS = [
+    ("Background Jazz", "spotify:playlist:37i9dQZF1DWV7EzJMK2FUI?si=e099779019b14bb7"),
+    ("Chilled Classical", "spotify:playlist:37i9dQZF1DWUvHZA1zLcjW?si=ef77a6c2ebf14473"),
+    ("Soft Lounge", "spotify:playlist:37i9dQZF1DX82pCGH5USnM?si=7752baaaeff94464"),
+    ("Soul Mix", "spotify:playlist:37i9dQZF1EQntZpEGgfBif?si=357c1eec328d4db2"),
+    ("Dinner with Friends", "spotify:playlist:37i9dQZF1DX4xuWVBs4FgJ?si=7c1574dfb25d4117"),
+    ("Coffee Table Jazz", "spotify:playlist:37i9dQZF1DWVqfgj8NZEp1?si=f90718546eb4492f")
+]
+
+# Cache för spelliste-bilder så vi inte frågar Spotify varje gång
+PLAYLIST_CACHE = []
+
 
 # --- HJÄLPFUNKTIONER ---
 
@@ -96,17 +110,48 @@ def get_players():
 
 @app.route('/get_playlists')
 def get_playlists():
-    """Returnerar dina kurerade favoritspellistor"""
-    playlists = [
-        ("Background Jazz", "spotify:playlist:37i9dQZF1DWV7EzJMK2FUI?si=e099779019b14bb7"),
-        ("Chilled Classical", "spotify:playlist:37i9dQZF1DWUvHZA1zLcjW?si=ef77a6c2ebf14473"),
-        ("Soft Lounge", "spotify:playlist:37i9dQZF1DX82pCGH5USnM?si=7752baaaeff94464"),
-        ("Soul Mix", "spotify:playlist:37i9dQZF1EQntZpEGgfBif?si=357c1eec328d4db2"),
-        ("Dinner with Friends", "spotify:playlist:37i9dQZF1DX4xuWVBs4FgJ?si=7c1574dfb25d4117"),
-        ("Coffee Table Jazz", "spotify:playlist:37i9dQZF1DWVqfgj8NZEp1?si=f90718546eb4492f")
-    ]
-    response = "\n".join([f"{name}|{url}" for name, url in playlists])
+    """Returnerar dina kurerade favoritspellistor i textformat (för t.ex. ESP32)"""
+    # Hämtar direkt från den globala variabeln FAVORITE_PLAYLISTS
+    response = "\n".join([f"{name}|{url}" for name, url in FAVORITE_PLAYLISTS])
     return response, 200, {'Content-Type': 'text/plain; charset=utf-8'}
+
+@app.route('/get_playlists_with_art')
+def get_playlists_with_art():
+    """Hämtar spellistor och hämtar dynamiskt omslagsbilder från Spotify (JSON för Webb)"""
+    global PLAYLIST_CACHE
+    
+    # Om vi redan har hämtat bilderna från Spotify, returnera cachen direkt
+    if PLAYLIST_CACHE:
+        return jsonify(PLAYLIST_CACHE)
+        
+    fetched_playlists = []
+    
+    # Använder samma globala FAVORITE_PLAYLISTS som den vanliga /get_playlists gör
+    for name, uri in FAVORITE_PLAYLISTS:
+        art_url = "https://via.placeholder.com/300x300/111/444?text=List"
+        
+        # Tvätta URI:n från ?si= för att API:et ska bli gladare
+        clean_uri = uri.split('?')[0].strip()
+        
+        try:
+            oembed_url = f"https://open.spotify.com/oembed?url={clean_uri}"
+            r = requests.get(oembed_url, timeout=2)
+            
+            if r.status_code == 200:
+                data = r.json()
+                if 'thumbnail_url' in data:
+                    art_url = data['thumbnail_url']
+        except Exception as e:
+            print(f"[VARNING] Kunde inte hämta bild från Spotify för {name}: {e}")
+            
+        fetched_playlists.append({
+            "name": name,
+            "url": uri,
+            "art": art_url
+        })
+        
+    PLAYLIST_CACHE = fetched_playlists
+    return jsonify(PLAYLIST_CACHE)
 
 @app.route('/play_url')
 def play_url():
@@ -114,24 +159,18 @@ def play_url():
     player_mac, room_name = get_player_info(request.args.get('room'))
     
     if player_mac and url:
-        # 1. TVÄTTA URL: Ta bort allt efter "?" (si=... etc)
-        # Spotty föredrar: spotify:playlist:37i9dQZF1EQntZpEGgfBif
         clean_url = url.split('?')[0].strip()
-        
         print(f"[ACTION] Spelar tvättad URL: {clean_url} i {room_name}")
         
-        # 2. SKICKA TILL LMS
-        # Vi kör shuffle, stop, clear och play i en sekvens
         lms_json_rpc(player_mac, ["playlist", "shuffle", 1])
         lms_json_rpc(player_mac, ["stop"])
         lms_json_rpc(player_mac, ["playlist", "clear"])
         
-        # Viktigt: Använd 'playlist' 'play' för URL:er
         res = lms_json_rpc(player_mac, ["playlist", "play", clean_url])
-        
         return jsonify({"status": "ok", "sent_url": clean_url, "lms_response": res})
     
     return "Missing URL or Room", 400
+
 @app.route('/daily')
 def play_daily():
     player_mac, _ = get_player_info(request.args.get('room'))
@@ -165,7 +204,6 @@ def set_volume():
     player_mac, room_name = get_player_info(room_arg)
     
     if player_mac:
-        # Om rummet är c5, kör vi UPnP-triggen först
         if room_name == "c5":
             set_c5_volume_upnp(level)
         
@@ -196,14 +234,11 @@ def get_title():
 @app.route('/pause')
 def pause_music():
     room_id = request.args.get('room')
-    player_data = get_player_info(room_id)
+    player_mac, room_name = get_player_info(room_id)
     
-    if player_data:
-        player_mac, room_name = player_data
+    if player_mac:
         print(f"[PAUSE] Skickar kommando till: {room_name} ({player_mac})", flush=True)
-        
         lms_json_rpc(player_mac, ["pause"])
-        
         return "OK"
     
     return "Error", 404
@@ -220,11 +255,8 @@ def next_track():
 def get_album_art():
     player_mac, _ = get_player_info(request.args.get('room'))
     if not player_mac:
-        return "/static/icon.png" # Fallback om inget rum är valt
+        return "/static/icon.png" 
         
-    # LMS genererar omslag via denna URL-struktur:
-    # http://[LMS-IP]:9000/music/current/cover.jpg?player=[MAC]
-    # Vi mappar om 127.0.0.1 till din servers externa IP (10.0.1.132) för att iPhone ska nå den
     lms_host = "10.0.1.132" 
     art_url = f"http://{lms_host}:9000/music/current/cover.jpg?player={player_mac}&time={int(time.time())}"
     
@@ -238,17 +270,99 @@ def get_status_raw():
     if not player_mac:
         return "pause"
         
-    # Vi ber LMS om status. 
-    # Detta motsvarar det din ESP32 parsar.
     res = lms_json_rpc(player_mac, ["status", "-", "1"])
     
     try:
-        # Här hämtar vi 'mode' direkt ur JSON-svaret
-        # Det blir antingen 'play', 'pause' eller 'stop'
         return res['result']['mode']
     except:
         return "pause"
 
+@app.route('/get_random_albums')
+def get_random_albums():
+    response = lms_json_rpc(None, ["albums", 0, 10, "sort:random", "tags:albj"])
+    
+    albums = []
+    
+    if response and 'result' in response and 'albums_loop' in response['result']:
+        items = response['result']['albums_loop']
+        
+        for item in items:
+            cover_id = item.get('artwork_track_id') or item.get('id')
+            
+            albums.append({
+                'id': item.get('id'),
+                'title': item.get('album'),
+                'artist': item.get('artist'),
+                'art': f"http://10.0.1.132:9000/music/{cover_id}/cover.jpg"
+            })
+            
+    return jsonify(albums)
+
+@app.route('/get_daily_mixes')
+def get_daily_mixes():
+    """Hämtar mixar och delar upp text-strängen för att visa artister"""
+    LMS_BASE = "http://10.0.1.132:9000"
+    player_mac = list(PLAYERS.values())[0] if PLAYERS else ""
+    
+    # Vi använder exakt de parametrar som fungerade i din curl
+    res = lms_json_rpc(player_mac, ["spotty", "items", 0, 80, "item_id:0", "menu:1", "tags:s"])
+    
+    mixes = []
+    if res and 'result' in res:
+        # Din version använder 'item_loop'
+        items = res['result'].get('item_loop', [])
+        
+        for item in items:
+            full_text = item.get('text', '')
+            
+            # Dela upp strängen vid nyrad-tecknet (\n)
+            parts = full_text.split('\n')
+            title = parts[0] # "Daily Mix 1"
+            
+            # Om det finns en del två, så är det artisterna
+            if len(parts) > 1:
+                description = parts[1] # "Wonder Eve, Manor Blue, David Parks & Silver and more"
+            else:
+                description = "Din personliga mix"
+
+            # Endast om det är en Mix eller Radar etc.
+            if any(x in title for x in ["Mix", "Radar", "Discovery", "daylist"]):
+                raw_id = item.get('params', {}).get('item_id') or item.get('id', '0.0')
+                
+                art_url = item.get('icon') or item.get('image')
+                if art_url and art_url.startswith('/'):
+                    art_url = LMS_BASE + art_url
+
+                mixes.append({
+                    'id': raw_id.split('.')[-1],
+                    'title': title,
+                    'description': description,
+                    'art': art_url
+                })
+
+    return jsonify(mixes)
+
+@app.route('/play_album')
+def play_specific_album():
+    album_id = request.args.get('album_id')
+    room_id = request.args.get('room')
+    player_mac, _ = get_player_info(room_id)
+    
+    if player_mac and album_id:
+        lms_json_rpc(player_mac, ["playlist", "shuffle", 0])
+        lms_json_rpc(player_mac, ["playlist", "clear"])
+        lms_json_rpc(player_mac, ["playlistcontrol", "cmd:load", f"album_id:{album_id}"])
+        return "OK"
+    return "Error", 400
+
+
+@app.route('/spy')
+def spy():
+    """Hämtar rådata från Lyrion via bridgens etablerade anslutning"""
+    player_mac = list(PLAYERS.values())[0] if PLAYERS else ""
+    # Vi ber om de 3 första objekten i Home-menyn med ALLA tänkbara taggar
+    res = lms_json_rpc(player_mac, ["spotty", "items", 0, 3, "item_id:0", "tags:asj"])
+    return jsonify(res)
 
 if __name__ == '__main__':
     print("--- Dörrvakten Bridge: Startad ---")
