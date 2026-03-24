@@ -1,0 +1,21 @@
+{
+  "short_name": "MultiLyrion",
+  "name": "MultiLyrion Ljudsystem",
+  "icons": [
+    {
+      "src": "icon_mr.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icon_mr.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ],
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#050505",
+  "theme_color": "#050505"
+}

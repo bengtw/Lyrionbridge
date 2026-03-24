@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <title>MultiLyrion</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;500;700;800&display=swap" rel="stylesheet">
+    <link rel="apple-touch-icon" href="icon_mr.png">
+    <link rel="manifest" href="manifest.json">
+</head>
+<body>
+    <div class="bg-glow"></div>
+
+    <div class="app-container">
+        <header class="top-nav">
+            <div class="select-container">
+                <select id="room-select">
+                    <option value="">Ansluter...</option>
+                </select>
+            </div>
+        </header>
+
+        <section class="player-core">
+            <div class="artwork-wrapper">
+                <img id="album-art" src="icon_mr.png" alt="Album Art">
+            </div>
+            
+            <div class="track-meta">
+                <p id="track-artist">Välj ett rum</p>
+                <h1 id="track-title">MultiLyrion</h1>
+            </div>
+        </section>
+
+        <section class="controls-wrapper">
+            <div class="volume-box">
+                <div class="vol-info">
+                    <span>Volym</span>
+                    <span id="vol-percentage">0%</span>
+                </div>
+                <input type="range" id="volume-slider" min="0" max="100" value="0" class="ios-slider">
+            </div>
+
+            <div class="main-transport">
+                <button class="btn-secondary" id="prev-btn">
+                    <svg viewBox="0 0 24 24"><path d="M6 6h2v12H6zm3.5 6L19 18V6z"/></svg>
+                </button>
+                <button class="btn-play" id="play-pause-btn">
+                    <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                </button>
+                <button class="btn-secondary" id="next-btn">
+                    <svg viewBox="0 0 24 24"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg>
+                </button>
+            </div>
+        </section>
+
+        <footer class="bottom-menu">
+            <button class="menu-item" id="random-album-btn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 3 21 3 21 8"></polyline><line x1="4" y1="20" x2="21" y2="3"></line><polyline points="21 16 21 21 16 21"></polyline><line x1="15" y1="15" x2="21" y2="21"></line><line x1="4" y1="4" x2="9" y2="9"></line></svg>
+                <span>Slumpa<br/>Album</span>
+            </button>
+            <button class="menu-item" id="daily-mix-btn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"></polyline><path d="M3 11V9a4 4 0 0 1 4-4h14"></path><polyline points="7 23 3 19 7 15"></polyline><path d="M21 13v2a4 4 0 0 1-4 4H3"></path><path d="M12 9v6"></path><path d="M10 11h2"></path></svg>
+                <span>Daily<br/>Mix</span>
+            </button>
+            <button class="menu-item highlight" id="open-playlists-btn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line><line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line><line x1="3" y1="12" x2="3.01" y2="12"></line><line x1="3" y1="18" x2="3.01" y2="18"></line></svg>
+                <span>Spotify<br/>Listor</span>
+            </button>
+        </footer>
+    </div>
+
+    <div id="playlist-modal" class="modal">
+        <div class="modal-glass">
+            <div class="modal-handle"></div>
+            <div class="modal-header"><h2>Mina Spellistor</h2></div>
+            <div id="playlist-list" class="playlist-stack"></div>
+            <div class="modal-footer">
+                <button class="close-btn-large">Stäng</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
