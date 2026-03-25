@@ -106,7 +106,7 @@ async function fetchPlayers() {
                 currentRoomNameEl.textContent = p.name;
                 lastArtUrl = "";
                 setTimeout(() => {
-                    document.getElementById('room-modal').classList.remove('active');
+                    closeModal(document.getElementById('room-modal'));
                     updateStatus();
                 }, 150);
             });
@@ -116,6 +116,11 @@ async function fetchPlayers() {
         console.warn("Kunde inte ladda spelare", e);
         document.getElementById('current-room-name').textContent = "Nätverksfel";
     }
+}
+
+function closeModal(modal) {
+    modal.classList.add('closing');
+    setTimeout(() => modal.classList.remove('active', 'closing'), 350);
 }
 
 // Gemensam helper för album/mix/spelliste-modaler
@@ -141,7 +146,7 @@ async function showGridModal(modalId, gridId, fetchUrl, itemMapper) {
                 </div>`;
             card.onclick = async () => {
                 await onSelect();
-                modal.classList.remove('active');
+                closeModal(modal);
                 setTimeout(updateStatus, 1000);
             };
             grid.appendChild(card);
@@ -216,9 +221,9 @@ function setupEventListeners() {
 
     // Stäng modaler
     window.onclick = e => {
-        if (e.target.classList.contains('modal')) e.target.classList.remove('active');
+        if (e.target.classList.contains('modal')) closeModal(e.target);
     };
     document.querySelectorAll('.close-btn-large').forEach(btn => {
-        btn.onclick = e => e.target.closest('.modal').classList.remove('active');
+        btn.onclick = e => closeModal(e.target.closest('.modal'));
     });
 }
