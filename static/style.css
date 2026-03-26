@@ -100,7 +100,7 @@ body {
     margin-bottom: 16px; background: #111; flex-shrink: 1;
 }
 
-#album-art { width: 100%; height: 100%; object-fit: cover; display: block; }
+#album-art { width: 100%; height: 100%; object-fit: cover; display: block; transform: scale(1.015); }
 
 .track-meta { text-align: center; width: 100%; max-width: 300px; }
 
