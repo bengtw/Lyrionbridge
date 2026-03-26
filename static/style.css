@@ -18,12 +18,13 @@
 
 html {
     overscroll-behavior: none;
-    background: var(--bg);
+    background: var(--bg); /* Dark fallback visible through transparent body */
+    height: 100%;
 }
 
 body {
     margin: 0;
-    background: var(--bg);
+    background: transparent; /* Let bg-art-blur show through at z-index: -2 */
     color: var(--text);
     font-family: 'Inter', -apple-system, sans-serif;
     height: 100dvh;
@@ -54,8 +55,8 @@ body {
 .app-container {
     display: flex;
     flex-direction: column;
-    height: 100dvh;
-    padding: env(safe-area-inset-top) 20px 0;
+    height: 100%;   /* inherits 100dvh from body */
+    padding: env(safe-area-inset-top) 20px calc(env(safe-area-inset-bottom) + 12px);
     justify-content: flex-start;
 }
 
@@ -170,10 +171,9 @@ body {
     grid-template-columns: repeat(4, 1fr);
     gap: 10px;
     background: none;
-    padding: 0px;
+    padding: 0;
     border-radius: 32px;
     border: none;
-    margin-top: auto;
 }
 
 .menu-item {
@@ -372,7 +372,7 @@ body {
         gap: 0 24px;
         padding: calc(env(safe-area-inset-top) + 10px)
                  calc(env(safe-area-inset-right) + 20px)
-                 10px
+                 calc(env(safe-area-inset-bottom) + 10px)
                  calc(env(safe-area-inset-left) + 20px);
         align-items: stretch;
         justify-content: flex-start;
