@@ -301,10 +301,31 @@ def transfer_playback():
     to_mac,   _ = get_player_info(request.args.get('to'))
     if not (from_mac and to_mac) or from_mac == to_mac:
         return "Error", 400
-    lms_json_rpc(from_mac, ["sync", to_mac])   # to_mac joins from_mac – koperar spår och position
-    time.sleep(0.5)
-    lms_json_rpc(to_mac, ["sync", "-"])         # to_mac lämnar gruppen och spelar självständigt
-    lms_json_rpc(from_mac, ["pause", 1])        # pausa källspelaren
+
+    status = lms_json_rpc(from_mac, ["status", "0", "500", "tags:u"])
+    if not status or 'result' not in status:
+        return "Could not get source status", 500
+
+    r         = status['result']
+    cur_index = r.get('playlist_cur_index', 0)
+    cur_time  = int(r.get('time', 0))
+    playlist  = r.get('playlist_loop', [])
+
+    if not playlist:
+        return "No playlist on source", 400
+
+    lms_json_rpc(to_mac, ["playlist", "clear"])
+    for track in playlist:
+        url = track.get('url', '')
+        if url:
+            lms_json_rpc(to_mac, ["playlist", "add", url])
+
+    lms_json_rpc(to_mac, ["playlist", "index", cur_index])
+    time.sleep(0.3)                         # vänta på att spåret laddas
+    lms_json_rpc(to_mac, ["time", cur_time])
+    lms_json_rpc(to_mac, ["play"])
+    lms_json_rpc(from_mac, ["pause", 1])
+
     return "OK"
 
 @app.route('/spy')
