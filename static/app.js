@@ -49,7 +49,6 @@ async function updateStatus() {
     // Volym
     if (vol && !isNaN(vol)) {
         slider.value = vol;
-        document.getElementById('vol-percentage').textContent = vol + "%";
     }
 
     // Album Art + dynamisk bakgrund
