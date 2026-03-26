@@ -9,14 +9,6 @@ document.addEventListener('touchmove', e => {
 }, { passive: false });
 
 window.addEventListener('DOMContentLoaded', () => {
-    // DEBUG — ta bort efter mätning
-    const dbg = document.createElement('div');
-    dbg.style.cssText = 'position:fixed;bottom:0;left:0;right:0;z-index:9999;background:rgba(255,0,0,0.85);color:white;font-size:13px;padding:6px 10px;text-align:center;';
-    dbg.textContent = `innerH:${window.innerHeight}  clientH:${document.documentElement.clientHeight}  screenH:${screen.height}  safeB:${getComputedStyle(document.documentElement).getPropertyValue('--sab')}`;
-    document.documentElement.style.setProperty('--sab', '0px'); // fallback
-    document.body.appendChild(dbg);
-    // END DEBUG
-
     fetchPlayers();
     setupEventListeners();
     if (currentRoom) updateStatus();
