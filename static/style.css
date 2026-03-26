@@ -17,7 +17,6 @@
 }
 
 html {
-    overflow: hidden;
     overscroll-behavior: none;
     background: var(--bg);
 }
