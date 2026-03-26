@@ -315,18 +315,12 @@ def transfer_playback():
         return "No playlist on source", 400
 
     current_url = playlist[cur_index].get('url', '')
-    print(f"[TRANSFER] {from_mac} → {to_mac}", flush=True)
-    print(f"[TRANSFER] {len(playlist)} spår, index={cur_index}, tid={cur_time}s", flush=True)
-    print(f"[TRANSFER] Aktuell URL: {current_url}", flush=True)
-
     if not current_url:
         return "Could not get current track URL", 400
 
-    r2 = lms_json_rpc(to_mac, ["playlist", "play", current_url])
-    print(f"[TRANSFER] play-svar: {r2}", flush=True)
+    lms_json_rpc(to_mac, ["playlist", "play", current_url])
     time.sleep(0.8)
     lms_json_rpc(to_mac, ["time", cur_time])
-    print(f"[TRANSFER] Seekade till {cur_time}s", flush=True)
 
     for track in playlist[cur_index + 1:]:
         url = track.get('url', '')
@@ -334,7 +328,6 @@ def transfer_playback():
             lms_json_rpc(to_mac, ["playlist", "add", url])
 
     lms_json_rpc(from_mac, ["pause", 1])
-    print(f"[TRANSFER] Klar", flush=True)
     return "OK"
 
 @app.route('/spy')
@@ -344,5 +337,7 @@ def spy():
 
 
 if __name__ == '__main__':
-    print("--- Lyrionbridge v2: Startad (port 5001) ---")
+    import logging
+    logging.getLogger('werkzeug').setLevel(logging.ERROR)
+    print("--- Lyrionbridge v2: Startad (port 5000) ---")
     app.run(host='0.0.0.0', port=5000, debug=True)
