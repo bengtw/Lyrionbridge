@@ -29,8 +29,6 @@ body {
     height: 100dvh;
     overflow: hidden;
     overscroll-behavior: none;
-    position: fixed;
-    width: 100%;
 }
 
 /* --- MAGISK DYNAMISK BAKGRUND --- */
@@ -57,7 +55,7 @@ body {
     display: flex;
     flex-direction: column;
     height: 100dvh;
-    padding: env(safe-area-inset-top) 20px calc(env(safe-area-inset-bottom) + 15px);
+    padding: env(safe-area-inset-top) 20px max(env(safe-area-inset-bottom), 20px);
     justify-content: flex-start;
 }
 
