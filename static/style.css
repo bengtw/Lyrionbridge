@@ -124,7 +124,7 @@ body {
 .track-meta h1 {
     font-size: 24px; margin: 0; line-height: 1.25; font-weight: 800;
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
-    overflow: hidden; min-height: 2.5em;
+    overflow: hidden; min-height: 1.25em;
 }
 
 /* --- CONTROLS --- */
