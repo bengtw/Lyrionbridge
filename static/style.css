@@ -106,7 +106,7 @@ body {
 }
 
 .artwork-wrapper {
-    width: 72vw; height: 72vw; max-width: 295px; max-height: 295px;
+    width: 72vw; height: 72vw; max-width: 310px; max-height: 310px;
     border-radius: 35px; overflow: hidden; box-shadow: var(--shadow);
     margin-bottom: 16px; background: #111; flex-shrink: 1;
 }
