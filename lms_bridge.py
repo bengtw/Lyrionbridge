@@ -307,7 +307,7 @@ def transfer_playback():
         return "Could not get source status", 500
 
     r         = status['result']
-    cur_index = r.get('playlist_cur_index', 0)
+    cur_index = int(r.get('playlist_cur_index', 0))
     cur_time  = int(r.get('time', 0))
     playlist  = r.get('playlist_loop', [])
 
