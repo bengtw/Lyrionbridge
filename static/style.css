@@ -175,7 +175,6 @@ body {
     border-radius: 32px;
     border: none;
     margin-top: auto;
-    padding-bottom: env(safe-area-inset-bottom);
 }
 
 .menu-item {
