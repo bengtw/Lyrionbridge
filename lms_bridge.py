@@ -9,7 +9,7 @@ app = Flask(__name__)
 # --- KONFIGURATION ---
 LMS_URL = "http://127.0.0.1:9000/jsonrpc.js"
 LMS_HOST = "10.0.1.132"
-C5_IP = "10.0.1.125"
+C5_IP   = "10.0.1.125"
 
 PLAYERS = {
     "office": "b8:27:eb:fb:30:d9",
@@ -30,6 +30,28 @@ PLAYLIST_CACHE = []
 
 
 # --- HJÄLPFUNKTIONER ---
+
+def set_c5_volume_upnp(volume_level):
+    """Sätter volymen på Audio Pro C5 via UPnP — används när C5 kör Spotify Connect."""
+    url = f"http://{C5_IP}:49152/upnp/control/render_control1"
+    headers = {
+        'Content-Type': 'text/xml; charset="utf-8"',
+        'SOAPACTION': '"urn:schemas-upnp-org:service:RenderingControl:1#SetVolume"'
+    }
+    body = f"""<?xml version="1.0" encoding="utf-8"?>
+    <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+        <s:Body>
+            <u:SetVolume xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1">
+                <InstanceID>0</InstanceID>
+                <Channel>Master</Channel>
+                <DesiredVolume>{volume_level}</DesiredVolume>
+            </u:SetVolume>
+        </s:Body>
+    </s:Envelope>"""
+    try:
+        requests.post(url, data=body, headers=headers, timeout=2)
+    except Exception as e:
+        print(f"[UPNP ERROR] C5: {e}")
 
 def lms_json_rpc(player_id, command_args):
     payload = {"id": 1, "method": "slim.request", "params": [player_id, command_args]}
@@ -52,25 +74,6 @@ def lms_load_album(player_mac, album_id):
     lms_json_rpc(player_mac, ["playlist", "clear"])
     return lms_json_rpc(player_mac, ["playlistcontrol", "cmd:load", f"album_id:{album_id}"])
 
-def set_c5_volume_upnp(volume_level):
-    url = f"http://{C5_IP}:49152/upnp/control/render_control1"
-    headers = {
-        'Content-Type': 'text/xml; charset="utf-8"',
-        'SOAPACTION': '"urn:schemas-upnp-org:service:RenderingControl:1#SetVolume"'
-    }
-    body = f"""<?xml version="1.0" encoding="utf-8"?>
-    <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-        <s:Body>
-            <u:SetVolume xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1">
-                <InstanceID>0</InstanceID><Channel>Master</Channel>
-                <DesiredVolume>{volume_level}</DesiredVolume>
-            </u:SetVolume>
-        </s:Body>
-    </s:Envelope>"""
-    try:
-        requests.post(url, data=body, headers=headers, timeout=2)
-    except Exception as e:
-        print(f"[UPNP ERROR] C5: {e}")
 
 def get_player_info(room_arg):
     if not room_arg:
