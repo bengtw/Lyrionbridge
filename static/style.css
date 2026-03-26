@@ -350,9 +350,14 @@ body {
 
     .player-core {
         grid-area: art;
-        padding-top: 0;
-        justify-content: center;
+        padding-top: 4px;
+        justify-content: flex-start;
         margin-bottom: 0;
+    }
+
+    .track-meta h1 {
+        -webkit-line-clamp: 1;
+        line-clamp: 1;
     }
 
     .artwork-wrapper {
@@ -395,5 +400,19 @@ body {
 
     .menu-item {
         min-height: 68px;
+    }
+
+    .modal-glass {
+        height: 96vh;
+        border-radius: 24px 24px 0 0;
+    }
+
+    #room-modal .modal-glass {
+        height: 96vh;
+        border-radius: 0 0 24px 24px;
+    }
+
+    .album-grid-container {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
     }
 }
