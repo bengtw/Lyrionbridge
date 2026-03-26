@@ -16,13 +16,21 @@
     -webkit-user-select: none;
 }
 
+html {
+    overflow: hidden;
+    overscroll-behavior: none;
+}
+
 body {
-    margin: 0; 
-    background: var(--bg); 
+    margin: 0;
+    background: var(--bg);
     color: var(--text);
     font-family: 'Inter', -apple-system, sans-serif;
-    height: 100vh; 
+    height: 100vh;
     overflow: hidden;
+    overscroll-behavior: none;
+    position: fixed;
+    width: 100%;
 }
 
 /* --- MAGISK DYNAMISK BAKGRUND --- */
@@ -50,7 +58,7 @@ body {
     flex-direction: column; 
     height: 100vh;
     padding: env(safe-area-inset-top) 20px calc(env(safe-area-inset-bottom) + 15px);
-    justify-content: space-between;
+    justify-content: flex-start;
 }
 
 /* --- HEADER BUTTON --- */
@@ -91,7 +99,7 @@ body {
 .player-core {
     flex: 1; display: flex; flex-direction: column;
     justify-content: flex-start; align-items: center; min-height: 0;
-    padding-top: 32px; margin-bottom: -50px;
+    padding-top: 32px;
 }
 
 .artwork-wrapper {
@@ -117,7 +125,7 @@ body {
 }
 
 /* --- CONTROLS --- */
-.controls-wrapper { padding-bottom: 16px; }
+.controls-wrapper { padding-bottom: 16px; margin-top: -20px; }
 
 .volume-box { width: 100%; }
 
@@ -160,13 +168,14 @@ body {
 
 /* --- BOTTOM MENU --- */
 .bottom-menu {
-    display: grid; 
+    display: grid;
     grid-template-columns: repeat(4, 1fr);
     gap: 10px;
     background: none;
-    padding: 0px; 
-    border-radius: 32px; 
+    padding: 0px;
+    border-radius: 32px;
     border: none;
+    margin-top: auto;
 }
 
 .menu-item {

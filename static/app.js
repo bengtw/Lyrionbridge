@@ -3,6 +3,10 @@ let currentRoom = localStorage.getItem('lastRoom') || "";
 let volumeThrottleTimer = null;
 let lastArtUrl = "";
 
+document.addEventListener('touchmove', e => {
+    if (!e.target.closest('.album-grid-container, .room-list')) e.preventDefault();
+}, { passive: false });
+
 window.addEventListener('DOMContentLoaded', () => {
     fetchPlayers();
     setupEventListeners();
