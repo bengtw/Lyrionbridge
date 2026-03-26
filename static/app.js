@@ -93,17 +93,17 @@ async function fetchPlayers() {
             const btn = document.createElement('button');
             btn.className = 'room-item';
             btn.dataset.id = p.playerid;
-            btn.textContent = p.name;
+            btn.textContent = capitalize(p.name);
             if (currentRoom === p.playerid) {
                 btn.classList.add('active');
-                currentRoomNameEl.textContent = p.name;
+                currentRoomNameEl.textContent = capitalize(p.name);
             }
             btn.addEventListener('click', () => {
                 document.querySelectorAll('.room-item').forEach(r => r.classList.remove('active'));
                 btn.classList.add('active');
                 currentRoom = p.playerid;
                 localStorage.setItem('lastRoom', currentRoom);
-                currentRoomNameEl.textContent = p.name;
+                currentRoomNameEl.textContent = capitalize(p.name);
                 lastArtUrl = "";
                 setTimeout(() => {
                     closeModal(document.getElementById('room-modal'));
@@ -116,6 +116,10 @@ async function fetchPlayers() {
         console.warn("Kunde inte ladda spelare", e);
         document.getElementById('current-room-name').textContent = "Nätverksfel";
     }
+}
+
+function capitalize(str) {
+    return str ? str.charAt(0).toUpperCase() + str.slice(1) : str;
 }
 
 function closeModal(modal) {
