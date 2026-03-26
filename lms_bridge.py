@@ -268,6 +268,24 @@ def get_daily_mixes():
             })
     return jsonify(mixes)
 
+@app.route('/get_daily_mixes_knob')
+def get_daily_mixes_knob():
+    """Enkel textlista för knappen: artist|index, en per rad, bara Daily Mix 1-6."""
+    player_mac = list(PLAYERS.values())[0] if PLAYERS else ""
+    res = lms_json_rpc(player_mac, ["spotty", "items", 0, 80, "item_id:0", "menu:1", "tags:s"])
+    lines = []
+    if res and 'result' in res:
+        for item in res['result'].get('item_loop', []):
+            parts = item.get('text', '').split('\n')
+            title = parts[0]
+            if not (title.startswith('Daily Mix ') and len(title) == 11 and '1' <= title[10] <= '6'):
+                continue
+            desc = parts[1] if len(parts) > 1 else ''
+            artist = desc.split(',')[0] if desc else ''
+            idx = int(title[10]) - 1
+            lines.append(f"{artist}|{idx}")
+    return '\n'.join(lines), 200, {'Content-Type': 'text/plain; charset=utf-8'}
+
 @app.route('/play_album')
 def play_specific_album():
     album_id = request.args.get('album_id')
