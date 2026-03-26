@@ -27,7 +27,6 @@ body {
     color: var(--text);
     font-family: 'Inter', -apple-system, sans-serif;
     height: 100dvh;
-    overflow: hidden;
     overscroll-behavior: none;
 }
 
