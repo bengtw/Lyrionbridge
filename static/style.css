@@ -136,7 +136,7 @@ body {
     touch-action: pan-x;
 }
 .ios-slider::-webkit-slider-thumb {
-    -webkit-appearance: none; width: 36px; height: 36px;
+    -webkit-appearance: none; width: 32px; height: 32px;
     background: var(--accent); border-radius: 50%; box-shadow: 0 4px 16px rgba(255,149,0,0.5);
 }
 
@@ -325,6 +325,75 @@ body {
     background: rgba(255, 149, 0, 0.1);
 }
 
-.btn-play:active, .btn-secondary:active, .close-btn-large:active, .room-item:active { 
-    transform: scale(0.94); 
+.btn-play:active, .btn-secondary:active, .close-btn-large:active, .room-item:active {
+    transform: scale(0.94);
+}
+
+/* --- LANDSCAPE LAYOUT --- */
+@media (orientation: landscape) {
+    .app-container {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        grid-template-rows: auto 1fr auto;
+        grid-template-areas:
+            "art nav"
+            "art controls"
+            "art menu";
+        gap: 0 24px;
+        padding: calc(env(safe-area-inset-top) + 10px)
+                 calc(env(safe-area-inset-right) + 20px)
+                 calc(env(safe-area-inset-bottom) + 10px)
+                 calc(env(safe-area-inset-left) + 20px);
+        align-items: stretch;
+        justify-content: flex-start;
+    }
+
+    .player-core {
+        grid-area: art;
+        padding-top: 0;
+        justify-content: center;
+        margin-bottom: 0;
+    }
+
+    .artwork-wrapper {
+        width: calc(100vh - 80px);
+        height: calc(100vh - 80px);
+        max-width: 280px;
+        max-height: 280px;
+        margin-bottom: 12px;
+        flex-shrink: 0;
+    }
+
+    .top-nav {
+        grid-area: nav;
+        padding: 0 0 10px;
+        display: flex;
+        align-items: flex-end;
+    }
+
+    .controls-wrapper {
+        grid-area: controls;
+        padding-bottom: 0;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+    }
+
+    .main-transport {
+        margin-bottom: 18px;
+    }
+
+    .ios-slider {
+        margin-bottom: 0;
+    }
+
+    .bottom-menu {
+        grid-area: menu;
+        margin-top: 0;
+        padding-top: 10px;
+    }
+
+    .menu-item {
+        min-height: 68px;
+    }
 }
