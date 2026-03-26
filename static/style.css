@@ -175,7 +175,7 @@ body {
     border-radius: 32px;
     border: none;
     margin-top: auto;
-    padding-bottom: 10px;
+    padding-bottom: 0;
 }
 
 .menu-item {
