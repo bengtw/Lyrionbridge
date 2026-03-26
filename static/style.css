@@ -218,6 +218,7 @@ body {
     top: 0; bottom: auto;
     border-radius: 0 0 35px 35px;
     border-top: none; border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    padding-top: calc(env(safe-area-inset-top) + 20px);
     animation: slideFromTop 0.42s cubic-bezier(0.15, 1, 0.3, 1);
 }
 #room-modal.closing .modal-glass { animation: slideToTop 0.38s cubic-bezier(0.4, 0, 0.8, 0.2) forwards; }
