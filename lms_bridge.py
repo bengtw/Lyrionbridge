@@ -49,7 +49,8 @@ def set_c5_volume_upnp(volume_level):
         </s:Body>
     </s:Envelope>"""
     try:
-        requests.post(url, data=body, headers=headers, timeout=2)
+        r = requests.post(url, data=body, headers=headers, timeout=2)
+        print(f"[UPNP] C5 svar: {r.status_code} {r.text[:200]}")
     except Exception as e:
         print(f"[UPNP ERROR] C5: {e}")
 
