@@ -19,11 +19,12 @@
 html {
     overflow: hidden;
     overscroll-behavior: none;
+    background: var(--bg);
 }
 
 body {
     margin: 0;
-    background: red;
+    background: var(--bg);
     color: var(--text);
     font-family: 'Inter', -apple-system, sans-serif;
     height: 100dvh;
