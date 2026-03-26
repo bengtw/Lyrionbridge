@@ -311,21 +311,26 @@ def transfer_playback():
     cur_time  = int(r.get('time', 0))
     playlist  = r.get('playlist_loop', [])
 
-    if not playlist:
+    if not playlist or cur_index >= len(playlist):
         return "No playlist on source", 400
 
-    lms_json_rpc(to_mac, ["playlist", "clear"])
-    for track in playlist:
+    current_url = playlist[cur_index].get('url', '')
+    if not current_url:
+        return "Could not get current track URL", 400
+
+    # Starta aktuell låt direkt — undviker opålitlig playlist index
+    lms_json_rpc(to_mac, ["stop"])
+    lms_json_rpc(to_mac, ["playlist", "play", current_url])
+    time.sleep(0.6)                          # vänta på att spåret börjar ladda
+    lms_json_rpc(to_mac, ["time", cur_time]) # spola till rätt position
+
+    # Lägg till resten av kön
+    for track in playlist[cur_index + 1:]:
         url = track.get('url', '')
         if url:
             lms_json_rpc(to_mac, ["playlist", "add", url])
 
-    lms_json_rpc(to_mac, ["playlist", "index", cur_index])
-    time.sleep(0.3)                         # vänta på att spåret laddas
-    lms_json_rpc(to_mac, ["time", cur_time])
-    lms_json_rpc(to_mac, ["play"])
     lms_json_rpc(from_mac, ["pause", 1])
-
     return "OK"
 
 @app.route('/spy')
