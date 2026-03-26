@@ -60,7 +60,7 @@ body {
     display: flex;
     flex-direction: column;
     height: 100%;
-    padding:  20px 8px;
+    padding: 20px 8px 4px 8px;
     justify-content: space-between;
 }
 
