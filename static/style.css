@@ -60,7 +60,7 @@ body {
     display: flex;
     flex-direction: column;
     height: 100%;
-    padding: env(safe-area-inset-top) 20px 0px;
+    padding:  20px 8px;
     justify-content: space-between;
 }
 
