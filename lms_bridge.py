@@ -33,7 +33,7 @@ PLAYLIST_CACHE = []
 
 def set_c5_volume_upnp(volume_level):
     """Sätter volymen på Audio Pro C5 via UPnP — används när C5 kör Spotify Connect."""
-    url = f"http://{C5_IP}:49152/upnp/control/render_control1"
+    url = f"http://{C5_IP}:49152/upnp/control/rendercontrol1"
     headers = {
         'Content-Type': 'text/xml; charset="utf-8"',
         'SOAPACTION': '"urn:schemas-upnp-org:service:RenderingControl:1#SetVolume"'
