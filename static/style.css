@@ -53,11 +53,9 @@ body {
 }
 
 .app-container {
-    position: fixed;
-    top: 0; left: 0; right: 0;
-    height: 100dvh;
     display: flex;
     flex-direction: column;
+    height: 100dvh;
     padding: env(safe-area-inset-top) 20px 0;
     justify-content: flex-start;
 }
