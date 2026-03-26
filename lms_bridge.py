@@ -295,6 +295,18 @@ def play_specific_album():
     lms_load_album(player_mac, album_id)
     return "OK"
 
+@app.route('/transfer')
+def transfer_playback():
+    from_mac, _ = get_player_info(request.args.get('from'))
+    to_mac,   _ = get_player_info(request.args.get('to'))
+    if not (from_mac and to_mac) or from_mac == to_mac:
+        return "Error", 400
+    lms_json_rpc(from_mac, ["sync", to_mac])   # to_mac joins from_mac – koperar spår och position
+    time.sleep(0.5)
+    lms_json_rpc(to_mac, ["sync", "-"])         # to_mac lämnar gruppen och spelar självständigt
+    lms_json_rpc(from_mac, ["pause", 1])        # pausa källspelaren
+    return "OK"
+
 @app.route('/spy')
 def spy():
     player_mac = list(PLAYERS.values())[0] if PLAYERS else ""

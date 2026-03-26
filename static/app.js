@@ -2,6 +2,7 @@ const POLL_INTERVAL = 3000;
 let currentRoom = localStorage.getItem('lastRoom') || "";
 let volumeThrottleTimer = null;
 let lastArtUrl = "";
+let transferMode = false;
 
 document.addEventListener('touchmove', e => {
     if (!e.target.closest('.album-grid-container, .room-list, .ios-slider')) e.preventDefault();
@@ -96,12 +97,24 @@ async function fetchPlayers() {
             const btn = document.createElement('button');
             btn.className = 'room-item';
             btn.dataset.id = p.playerid;
-            btn.textContent = capitalize(p.name);
-            if (currentRoom === p.playerid) {
+            const isCurrent = currentRoom === p.playerid;
+            if (isCurrent) {
                 btn.classList.add('active');
                 currentRoomNameEl.textContent = capitalize(p.name);
             }
-            btn.addEventListener('click', () => {
+            if (transferMode && isCurrent) {
+                btn.innerHTML = `${capitalize(p.name)} <span style="font-size:10px;opacity:0.5;margin-left:6px">SPELAR HÄR</span>`;
+                btn.style.opacity = '0.45';
+                btn.style.pointerEvents = 'none';
+            } else {
+                btn.textContent = capitalize(p.name);
+            }
+            btn.addEventListener('click', async () => {
+                if (transferMode && p.playerid === currentRoom) return;
+                if (transferMode) {
+                    btn.textContent = "Flyttar…";
+                    await fetch(`/transfer?from=${encodeURIComponent(currentRoom)}&to=${encodeURIComponent(p.playerid)}`);
+                }
                 document.querySelectorAll('.room-item').forEach(r => r.classList.remove('active'));
                 btn.classList.add('active');
                 currentRoom = p.playerid;
@@ -168,7 +181,24 @@ async function showGridModal(modalId, gridId, fetchUrl, itemMapper) {
 
 function setupEventListeners() {
     document.getElementById('room-select-btn').addEventListener('click', () => {
+        transferMode = false;
+        document.getElementById('tab-select').classList.add('active');
+        document.getElementById('tab-transfer').classList.remove('active');
         document.getElementById('room-modal').classList.add('active');
+        fetchPlayers();
+    });
+
+    document.getElementById('tab-select').addEventListener('click', () => {
+        transferMode = false;
+        document.getElementById('tab-select').classList.add('active');
+        document.getElementById('tab-transfer').classList.remove('active');
+        fetchPlayers();
+    });
+
+    document.getElementById('tab-transfer').addEventListener('click', () => {
+        transferMode = true;
+        document.getElementById('tab-transfer').classList.add('active');
+        document.getElementById('tab-select').classList.remove('active');
         fetchPlayers();
     });
 
