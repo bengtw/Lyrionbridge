@@ -27,6 +27,7 @@ body {
     color: var(--text);
     font-family: 'Inter', -apple-system, sans-serif;
     height: 100dvh;
+    overflow: clip; /* Clips overflow without creating a scroll container — keeps position:fixed relative to true viewport */
     overscroll-behavior: none;
 }
 
