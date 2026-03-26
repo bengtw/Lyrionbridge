@@ -342,7 +342,7 @@ def c5_discover():
         try:
             r = requests.get(f"http://{C5_IP}:{port}/description.xml", timeout=2)
             if r.status_code == 200:
-                results[f"port_{port}"] = r.text[:2000]
+                results[f"port_{port}"] = r.text[:5000]
                 break
         except Exception as e:
             results[f"port_{port}"] = str(e)
