@@ -26,7 +26,7 @@ body {
     background: var(--bg);
     color: var(--text);
     font-family: 'Inter', -apple-system, sans-serif;
-    height: 100vh;
+    height: 100dvh;
     overflow: hidden;
     overscroll-behavior: none;
     position: fixed;
@@ -54,9 +54,9 @@ body {
 }
 
 .app-container {
-    display: flex; 
-    flex-direction: column; 
-    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    height: 100dvh;
     padding: env(safe-area-inset-top) 20px calc(env(safe-area-inset-bottom) + 15px);
     justify-content: flex-start;
 }
