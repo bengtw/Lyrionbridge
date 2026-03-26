@@ -19,7 +19,6 @@
 html {
     overscroll-behavior: none;
     background: var(--bg); /* Dark fallback visible through transparent body */
-    height: 100%;
 }
 
 body {
@@ -56,7 +55,7 @@ body {
     display: flex;
     flex-direction: column;
     height: 100%;   /* inherits 100dvh from body */
-    padding: env(safe-area-inset-top) 20px calc(env(safe-area-inset-bottom) + 12px);
+    padding: env(safe-area-inset-top) 20px 0;
     justify-content: flex-start;
 }
 
@@ -171,7 +170,7 @@ body {
     grid-template-columns: repeat(4, 1fr);
     gap: 10px;
     background: none;
-    padding: 0;
+    padding: 0 0 max(env(safe-area-inset-bottom), 12px);
     border-radius: 32px;
     border: none;
 }
