@@ -4,7 +4,7 @@ let volumeThrottleTimer = null;
 let lastArtUrl = "";
 
 document.addEventListener('touchmove', e => {
-    if (!e.target.closest('.album-grid-container, .room-list')) e.preventDefault();
+    if (!e.target.closest('.album-grid-container, .room-list, .ios-slider')) e.preventDefault();
 }, { passive: false });
 
 window.addEventListener('DOMContentLoaded', () => {
