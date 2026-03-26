@@ -373,7 +373,7 @@ body {
         gap: 0 24px;
         padding: calc(env(safe-area-inset-top) + 10px)
                  calc(env(safe-area-inset-right) + 20px)
-                 calc(env(safe-area-inset-bottom) + 10px)
+                 10px
                  calc(env(safe-area-inset-left) + 20px);
         align-items: stretch;
         justify-content: flex-start;
