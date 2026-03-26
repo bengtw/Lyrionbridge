@@ -17,18 +17,19 @@
 }
 
 html {
+    height: 100%;
     overscroll-behavior: none;
-    background: var(--bg); /* Dark fallback visible through transparent body */
+    background: var(--bg);
 }
 
 body {
     margin: 0;
+    height: 100%;
     background: transparent; /* Let bg-art-blur show through at z-index: -2 */
     color: var(--text);
     font-family: 'Inter', -apple-system, sans-serif;
-    height: 100dvh;
-    overflow: clip; /* Clips overflow without creating a scroll container — keeps position:fixed relative to true viewport */
     overscroll-behavior: none;
+    /* No overflow:hidden/clip — those break position:fixed on iOS. Scroll prevented by JS touchmove handler. */
 }
 
 /* --- MAGISK DYNAMISK BAKGRUND --- */
@@ -170,7 +171,7 @@ body {
     grid-template-columns: repeat(4, 1fr);
     gap: 10px;
     background: none;
-    padding: 0 0 max(env(safe-area-inset-bottom), 12px);
+    padding: 0 0 env(safe-area-inset-bottom);
     border-radius: 32px;
     border: none;
 }
