@@ -334,6 +334,20 @@ def transfer_playback():
     lms_json_rpc(from_mac, ["pause", 1])
     return "OK"
 
+@app.route('/c5_discover')
+def c5_discover():
+    """Hämtar UPnP device description från C5 för att hitta rätt service-URL."""
+    results = {}
+    for port in [49152, 1400, 8080, 80]:
+        try:
+            r = requests.get(f"http://{C5_IP}:{port}/description.xml", timeout=2)
+            if r.status_code == 200:
+                results[f"port_{port}"] = r.text[:2000]
+                break
+        except Exception as e:
+            results[f"port_{port}"] = str(e)
+    return jsonify(results)
+
 @app.route('/spy')
 def spy():
     player_mac = list(PLAYERS.values())[0] if PLAYERS else ""
