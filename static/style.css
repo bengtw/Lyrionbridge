@@ -19,6 +19,7 @@
 html {
     overflow: hidden;
     overscroll-behavior: none;
+    background: red;
 }
 
 body {
@@ -96,8 +97,8 @@ body {
 /* --- PLAYER CORE --- */
 .player-core {
     flex: 1; display: flex; flex-direction: column;
-    justify-content: flex-start; align-items: center; min-height: 0;
-    padding-top: 32px;
+    justify-content: flex-end; align-items: center; min-height: 0;
+    padding-bottom: 16px;
 }
 
 .artwork-wrapper {
