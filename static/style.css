@@ -1,4 +1,5 @@
 :root {
+    --sab: env(safe-area-inset-bottom, 0px);
     --bg: #050505;
     --card: rgba(255, 255, 255, 0.08);
     --text: #ffffff;
