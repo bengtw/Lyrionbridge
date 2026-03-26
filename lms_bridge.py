@@ -322,13 +322,11 @@ def transfer_playback():
     if not current_url:
         return "Could not get current track URL", 400
 
-    # Starta aktuell låt direkt — undviker opålitlig playlist index
-    r1 = lms_json_rpc(to_mac, ["stop"])
     r2 = lms_json_rpc(to_mac, ["playlist", "play", current_url])
     print(f"[TRANSFER] play-svar: {r2}", flush=True)
-    time.sleep(0.6)
-    r3 = lms_json_rpc(to_mac, ["time", cur_time])
-    print(f"[TRANSFER] time-svar: {r3}", flush=True)
+    time.sleep(0.8)
+    lms_json_rpc(to_mac, ["time", cur_time])
+    print(f"[TRANSFER] Seekade till {cur_time}s", flush=True)
 
     for track in playlist[cur_index + 1:]:
         url = track.get('url', '')
