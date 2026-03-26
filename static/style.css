@@ -120,15 +120,15 @@ body {
 
 .volume-box { width: 100%; }
 
-.vol-info { display: flex; justify-content: space-between; font-size: 11px; color: var(--text-dim); margin-bottom: 10px; text-transform: uppercase; }
 
 .ios-slider {
-    -webkit-appearance: none; width: 100%; height: 6px; 
+    -webkit-appearance: none; width: 100%; height: 8px;
     background: rgba(255,255,255,0.15); border-radius: 10px; margin-bottom: 30px;
+    touch-action: pan-x;
 }
 .ios-slider::-webkit-slider-thumb {
-    -webkit-appearance: none; width: 28px; height: 28px; 
-    background: var(--accent); border-radius: 50%; box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+    -webkit-appearance: none; width: 36px; height: 36px;
+    background: var(--accent); border-radius: 50%; box-shadow: 0 4px 16px rgba(255,149,0,0.5);
 }
 
 .main-transport { display: flex; justify-content: space-around; align-items: center; margin-bottom: 20px; }

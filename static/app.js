@@ -169,10 +169,25 @@ function setupEventListeners() {
         fetchPlayers();
     });
 
+    let lastVolumeSent = null;
     document.getElementById('volume-slider').addEventListener('input', e => {
-        document.getElementById('vol-percentage').textContent = e.target.value + "%";
-        clearTimeout(volumeThrottleTimer);
-        volumeThrottleTimer = setTimeout(() => sendCommand('set_volume', { level: e.target.value }), 150);
+        const val = e.target.value;
+
+        lastVolumeSent = val;
+        if (!volumeThrottleTimer) {
+            volumeThrottleTimer = setInterval(() => {
+                if (lastVolumeSent !== null) {
+                    sendCommand('set_volume', { level: lastVolumeSent });
+                    lastVolumeSent = null;
+                }
+            }, 300);
+        }
+    });
+    document.getElementById('volume-slider').addEventListener('change', e => {
+        clearInterval(volumeThrottleTimer);
+        volumeThrottleTimer = null;
+        sendCommand('set_volume', { level: e.target.value });
+        lastVolumeSent = null;
     });
 
     document.getElementById('play-pause-btn').onclick = async () => {
