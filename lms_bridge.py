@@ -321,6 +321,11 @@ def transfer_playback():
     if not current_url:
         return "Could not get current track URL", 400
 
+    if to_mac == PLAYERS.get("c5"):
+        lms_json_rpc(to_mac, ["power", 1])
+        set_c5_volume_upnp(20)
+        time.sleep(2.0)
+
     lms_json_rpc(to_mac, ["playlist", "play", current_url])
     time.sleep(0.8)
     lms_json_rpc(to_mac, ["time", cur_time])
