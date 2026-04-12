@@ -207,12 +207,26 @@ body {
 .modal.active { display: flex !important; pointer-events: auto; }
 
 .modal-glass {
-    position: absolute; bottom: 0; width: 100%; height: 85vh;
-    background: rgba(30, 30, 35, 0.97); backdrop-filter: blur(40px); -webkit-backdrop-filter: blur(40px);
-    border-radius: 35px 35px 0 0; padding: 20px 25px; display: flex; flex-direction: column;
-    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    position: absolute;
+    /* 1. Skapa luft från botten och sidorna */
+    bottom: 15px; 
+    left: 10px;
+    right: 10px;
+    width: calc(100% - 20px); /* 10px luft på varje sida */
+    
+    /* 2. Behåll din befintliga styling */
+    height: 82vh;
+    background: rgba(30, 30, 35, 0.97);
+    backdrop-filter: blur(40px);
+    -webkit-backdrop-filter: blur(40px);
+    border-radius: 30px; /* Rundade hörn hela vägen runt nu */
+    display: flex;
+    flex-direction: column;
+    
+    /* 3. Se till att animationen fortfarande fungerar */
     animation: slideUp 0.4s cubic-bezier(0.2, 1, 0.3, 1);
 }
+
 .modal.closing .modal-glass { animation: slideDown 0.38s cubic-bezier(0.4, 0, 0.8, 0.2) forwards; }
 
 /* Spelar-overlay: uppifrån */
@@ -225,34 +239,67 @@ body {
 }
 #room-modal.closing .modal-glass { animation: slideToTop 0.38s cubic-bezier(0.4, 0, 0.8, 0.2) forwards; }
 
-@keyframes slideUp      { from { transform: translateY(100%); }  to { transform: translateY(0); } }
+@keyframes slideUp {
+    from { transform: translateY(100%); opacity: 0; }
+    to { transform: translateY(0); opacity: 1; }
+}
 @keyframes slideDown    { from { transform: translateY(0); }     to { transform: translateY(100%); } }
 @keyframes slideFromTop { from { transform: translateY(-100%); } to { transform: translateY(0); } }
 @keyframes slideToTop   { from { transform: translateY(0); }     to { transform: translateY(-100%); } }
 
 .modal-title {
-    text-align: center; margin: 0 0 20px 0; font-size: 16px; font-weight: 700;
-    text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim);
-    flex-shrink: 0;
+    text-align: center;
+    padding: 25px 0 10px; /* Mer luft i toppen */
+    margin: 0;
+    font-size: 18px;
+    font-weight: 800;
+    color: white;
 }
 
 .close-btn-large {
-    width: 100%; background: var(--accent); border: none; color: black;
-    padding: 18px; border-radius: 22px; font-size: 17px; font-weight: 800; text-transform: uppercase;
-    margin-top: auto;
-    flex-shrink: 0;
+    width: 50%;
+    margin: 10px auto 25px; /* Drar ner knappen lite från mask-zonen */
+    display: block;
+    background: var(--accent);
+    border: none;
+    color: black;
+    padding: 16px;
+    border-radius: 20px;
+    font-size: 16px;
+    font-weight: 800;
+    text-transform: uppercase;
 }
 
-/* --- ALBUM GRID (Tips & Listor) --- */
 .album-grid-container {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 15px;
-    padding: 5px 0 15px 0;
+    
+    /* Öka vertikalt gap till 28px, minska horisontellt till 12px */
+    gap: 28px 12px; 
+    
+    /* Minska sidopadding till 12px (topp, sidor, botten) */
+    padding: 5px 12px 40px; 
+    
     overflow-y: auto;
-    overflow-x: hidden; 
-    flex: 1; 
+    flex: 1;
     min-height: 0;
+    scrollbar-gutter: stable both-edges;
+
+    /* Behåll mask-image för den mjuka snygga scrollen */
+    -webkit-mask-image: linear-gradient(
+        to bottom,
+        transparent 0%,
+        black 5%,
+        black 95%,
+        transparent 100%
+    );
+    mask-image: linear-gradient(
+        to bottom,
+        transparent 0%,
+        black 5%,
+        black 95%,
+        transparent 100%
+    );
 }
 
 .album-card-item {
@@ -449,4 +496,38 @@ body {
     .album-grid-container {
         grid-template-columns: repeat(4, minmax(0, 1fr));
     }
+}
+
+/* --- SNYGGARE SCROLLBAR --- */
+
+/* 1. Definiera bredden på scrollbaren */
+.album-grid-container::-webkit-scrollbar,
+.room-list::-webkit-scrollbar {
+    width: 6px; /* Väldigt tunn */
+}
+
+/* 2. Bakgrunden (spåret) - gör den genomskinlig */
+.album-grid-container::-webkit-scrollbar-track,
+.room-list::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+/* 3. Själva "handtaget" - gör det mörkt och diskret */
+.album-grid-container::-webkit-scrollbar-thumb,
+.room-list::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.2); /* Svagt genomskinlig vit */
+    border-radius: 10px;
+}
+
+/* 4. Handtaget vid hovring - lys upp lite */
+.album-grid-container::-webkit-scrollbar-thumb:hover,
+.room-list::-webkit-scrollbar-thumb:hover {
+    background: var(--accent); /* Blir orange vid hovring för feedback */
+}
+
+/* För Firefox */
+.album-grid-container,
+.room-list {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
 }
