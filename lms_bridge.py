@@ -289,6 +289,56 @@ def get_daily_mixes_knob():
             lines.append(f"{title}|{desc}|{idx}")
     return '\n'.join(lines), 200, {'Content-Type': 'text/plain; charset=utf-8'}
 
+@app.route('/get_radio_favorites')
+def get_radio_favorites():
+    res = lms_json_rpc("", ["favorites", "items", "0", "50"])
+    stations = []
+    
+    if res and 'result' in res:
+        items = res['result'].get('loop_loop', [])
+        
+        for item in items:
+            fav_id = item.get('id')
+            if not fav_id: continue
+            
+            art = item.get('image') or item.get('icon')
+            if art and art.startswith('/'):
+                art = f"http://{LMS_HOST}:9000{art}"
+            elif not art:
+                art = "https://via.placeholder.com/300x300/111/444?text=Radio"
+
+            stations.append({
+                'id': fav_id,
+                'name': item.get('name', 'Okänd kanal'),
+                'url': fav_id,
+                'art': art
+            })
+        
+        # Sortera listan alfabetiskt baserat på namnet
+        stations = sorted(stations, key=lambda x: x['name'].lower())
+            
+    return jsonify(stations)
+
+@app.route('/play_radio')
+def play_radio():
+    fav_id = request.args.get('url') # Detta är vårt ID, t.ex. "552e83ef.0"
+    player_mac, room_name = get_player_info(request.args.get('room'))
+    
+    if not (player_mac and fav_id):
+        return "Missing ID or Room", 400
+        
+    print(f"[RADIO] Försöker spela favorit-ID {fav_id} i {room_name}")
+    
+    # 1. Stoppa nuvarande uppspelning och rensa kön
+    lms_json_rpc(player_mac, ["stop"])
+    lms_json_rpc(player_mac, ["playlist", "clear"])
+    
+    # 2. Spela favoriten. Formatet ["favorites", "playlist", "play", "item_id:X"] 
+    # är det som LMS förväntar sig för att trigga en favorit.
+    res = lms_json_rpc(player_mac, ["favorites", "playlist", "play", f"item_id:{fav_id}"])
+    
+    return jsonify({"status": "ok", "lms_response": res})
+
 @app.route('/play_album')
 def play_specific_album():
     album_id = request.args.get('album_id')

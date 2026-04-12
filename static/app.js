@@ -4,6 +4,11 @@ let volumeThrottleTimer = null;
 let lastArtUrl = "";
 let transferMode = false;
 
+let cacheRadio = null;
+let cacheDaily = null;
+let cachePlaylists = null;
+let cacheTips = null;
+
 document.addEventListener('touchmove', e => {
     if (!e.target.closest('.album-grid-container, .room-list, .ios-slider')) e.preventDefault();
 }, { passive: false });
@@ -11,8 +16,17 @@ document.addEventListener('touchmove', e => {
 window.addEventListener('DOMContentLoaded', () => {
     fetchPlayers();
     setupEventListeners();
+    
     if (currentRoom) updateStatus();
+    
+    // 1. Kör preload direkt vid start
+    preloadAllLists(); 
+    
+    // 2. Uppdatera status ofta (som förut)
     setInterval(updateStatus, POLL_INTERVAL);
+    
+    // 3. Uppdatera cachen för alla listor var 30:e minut
+    setInterval(preloadAllLists, 1800000); 
 });
 
 
@@ -76,6 +90,29 @@ async function updateStatus() {
 
 
 // === 2. DATAHÄMTNING ===
+
+async function preloadAllLists() {
+    const now = new Date().toLocaleTimeString();
+    console.log(`[${now}] Bakgrundsuppdatering av listor startad...`);
+    
+    try {
+        const [radio, daily, playlists, tips] = await Promise.all([
+            fetch('/get_radio_favorites').then(r => r.json()).catch(() => null),
+            fetch('/get_daily_mixes').then(r => r.json()).catch(() => null),
+            fetch('/get_playlists_with_art').then(r => r.json()).catch(() => null),
+            fetch('/get_random_albums').then(r => r.json()).catch(() => null)
+        ]);
+
+        if (radio) cacheRadio = radio;
+        if (daily) cacheDaily = daily;
+        if (playlists) cachePlaylists = playlists;
+        if (tips) cacheTips = tips;
+        
+        console.log(`[${now}] All data uppdaterad.`);
+    } catch (e) {
+        console.warn("Kunde inte uppdatera cache i bakgrunden", e);
+    }
+}
 
 async function fetchPlayers() {
     try {
@@ -143,43 +180,65 @@ function closeModal(modal) {
     setTimeout(() => modal.classList.remove('active', 'closing'), 350);
 }
 
-// Gemensam helper för album/mix/spelliste-modaler
-async function showGridModal(modalId, gridId, fetchUrl, itemMapper) {
+async function showGridModal(modalId, gridId, fetchUrl, itemMapper, cacheData = null) {
     const modal = document.getElementById(modalId);
     const grid  = document.getElementById(gridId);
     modal.classList.add('active');
-    grid.innerHTML = '<div style="grid-column:1/-1;text-align:center;padding:40px;color:var(--text-dim)">Hämtar...</div>';
-    try {
-        const items = await fetch(fetchUrl).then(r => r.json());
-        grid.innerHTML = '';
-        items.forEach(item => {
-            const { art, title, subtitle, onSelect } = itemMapper(item);
-            const card = document.createElement('div');
-            card.className = 'album-card-item';
-            card.innerHTML = `
-                <div class="album-art-placeholder">
-                    <img src="${art}" loading="lazy" onerror="this.src='https://via.placeholder.com/300x300/111/444?text=?'">
-                </div>
-                <div class="album-info">
-                    <span class="alb-title">${title}</span>
-                    <span class="alb-artist">${subtitle}</span>
-                </div>`;
-            card.onclick = async () => {
-                await onSelect();
-                closeModal(modal);
-                setTimeout(updateStatus, 1000);
-            };
-            grid.appendChild(card);
-        });
-    } catch (e) {
-        grid.innerHTML = '<div style="grid-column:1/-1;text-align:center;padding:20px;color:red;">Kunde inte hämta data.</div>';
+    
+    // Om cacheData är null, tömmer vi listan omedelbart och visar laddningstext
+    if (!cacheData) {
+        grid.innerHTML = '<div style="grid-column:1/-1;text-align:center;padding:40px;color:var(--text-dim)">Hämtar nya tips...</div>';
+    } else {
+        // Om vi har cache (för Radio/Daily), rendera den direkt
+        render(grid, cacheData, itemMapper, modal);
     }
+
+    try {
+        const freshData = await fetch(fetchUrl).then(r => r.json());
+        // Rendera den färska datan (ersätter ev. laddningstext eller gammal cache)
+        render(grid, freshData, itemMapper, modal);
+        
+        // Uppdatera cachen i bakgrunden (utom för tips om du vill spara bandbredd)
+        if (modalId === 'radio-modal') cacheRadio = freshData;
+        if (modalId === 'daily-modal') cacheDaily = freshData;
+        if (modalId === 'playlist-modal') cachePlaylists = freshData;
+        if (modalId === 'album-modal') cacheTips = freshData;
+    } catch (e) {
+        if (!grid.innerHTML || grid.innerHTML.includes('Hämtar')) {
+            grid.innerHTML = '<div style="grid-column:1/-1;text-align:center;padding:20px;color:red;">Kunde inte hämta tips.</div>';
+        }
+    }
+}
+
+// En liten helper för att slippa duplicerad kod inuti showGridModal
+function render(grid, items, itemMapper, modal) {
+    grid.innerHTML = '';
+    items.forEach(item => {
+        const { art, title, subtitle, onSelect } = itemMapper(item);
+        const card = document.createElement('div');
+        card.className = 'album-card-item';
+        card.innerHTML = `
+            <div class="album-art-placeholder">
+                <img src="${art}" loading="lazy" onerror="this.src='https://via.placeholder.com/300x300/111/444?text=?'">
+            </div>
+            <div class="album-info">
+                <span class="alb-title">${title}</span>
+                <span class="alb-artist">${subtitle}</span>
+            </div>`;
+        card.onclick = async () => {
+            await onSelect();
+            closeModal(modal);
+            setTimeout(updateStatus, 1000);
+        };
+        grid.appendChild(card);
+    });
 }
 
 
 // === 3. EVENT LISTENERS ===
 
 function setupEventListeners() {
+    // 1. RUMSVÄLJARE & TABS
     document.getElementById('room-select-btn').addEventListener('click', () => {
         transferMode = false;
         document.getElementById('tab-select').classList.add('active');
@@ -202,10 +261,10 @@ function setupEventListeners() {
         fetchPlayers();
     });
 
+    // 2. VOLYM (Med throttling för att inte sänka servern)
     let lastVolumeSent = null;
     document.getElementById('volume-slider').addEventListener('input', e => {
         const val = e.target.value;
-
         lastVolumeSent = val;
         if (!volumeThrottleTimer) {
             volumeThrottleTimer = setInterval(() => {
@@ -216,6 +275,7 @@ function setupEventListeners() {
             }, 300);
         }
     });
+
     document.getElementById('volume-slider').addEventListener('change', e => {
         clearInterval(volumeThrottleTimer);
         volumeThrottleTimer = null;
@@ -223,6 +283,7 @@ function setupEventListeners() {
         lastVolumeSent = null;
     });
 
+    // 3. TRANSPORTKONTROLLER
     document.getElementById('play-pause-btn').onclick = async () => {
         await sendCommand('toggle_play_pause');
         setTimeout(updateStatus, 300);
@@ -234,47 +295,62 @@ function setupEventListeners() {
     };
 
     document.getElementById('prev-btn').onclick = async () => {
-        await sendCommand('next');
+        await sendCommand('prev'); // Fixade även så denna ropar på 'prev' istället för 'next'
         setTimeout(updateStatus, 500);
     };
 
-    document.getElementById('random-album-btn').onclick = async () => {
-        await sendCommand('play_random_album');
-        setTimeout(updateStatus, 1000);
-    };
+    // 4. MENYKNAPPAR (Med Cache-stöd för omedelbar respons)
 
-    document.getElementById('tips-album-btn').onclick = () => {
+    // RADIO (Ersätter gamla Random Album)
+    document.getElementById('radio-btn').onclick = () => {
         if (!currentRoom) { alert("Välj ett rum först!"); return; }
-        showGridModal('album-modal', 'album-grid', '/get_random_albums', album => ({
-            art:      album.art,
-            title:    album.title,
-            subtitle: album.artist,
-            onSelect: () => sendCommand('play_album', { album_id: album.id })
-        }));
+        showGridModal('radio-modal', 'radio-grid', '/get_radio_favorites', station => ({
+            art:      station.art,
+            title:    station.name,
+            subtitle: 'Radiokanal',
+            onSelect: () => sendCommand('play_radio', { url: station.url })
+        }), cacheRadio); 
     };
 
+// TIPS PÅ ALBUM (Tvingar alltid ny hämtning)
+document.getElementById('tips-album-btn').onclick = () => {
+    if (!currentRoom) { alert("Välj ett rum först!"); return; }
+    // Vi skickar 'null' istället för 'cacheTips' för att rensa gamla tips
+    showGridModal('album-modal', 'album-grid', '/get_random_albums', album => ({
+        art:      album.art,
+        title:    album.title,
+        subtitle: album.artist,
+        onSelect: () => sendCommand('play_album', { album_id: album.id })
+    }), null); 
+};
+
+    // DAILY MIXES
     document.getElementById('daily-mix-btn').onclick = () => {
+        if (!currentRoom) { alert("Välj ett rum först!"); return; }
         showGridModal('daily-modal', 'daily-grid', '/get_daily_mixes', mix => ({
             art:      mix.art,
             title:    mix.title,
             subtitle: mix.description,
             onSelect: () => sendCommand('daily', { index: mix.id.split('.').pop() })
-        }));
+        }), cacheDaily);
     };
 
+    // SPOTIFY LISTOR
     document.getElementById('open-playlists-btn').onclick = () => {
+        if (!currentRoom) { alert("Välj ett rum först!"); return; }
         showGridModal('playlist-modal', 'playlist-list', '/get_playlists_with_art', pl => ({
             art:      pl.art,
             title:    pl.name,
             subtitle: 'Spotify Mix',
             onSelect: () => sendCommand('play_url', { url: pl.url })
-        }));
+        }), cachePlaylists);
     };
 
-    // Stäng modaler
+    // 5. STÄNG MODALER
     window.onclick = e => {
         if (e.target.classList.contains('modal')) closeModal(e.target);
     };
+
     document.querySelectorAll('.close-btn-large').forEach(btn => {
         btn.onclick = e => closeModal(e.target.closest('.modal'));
     });
