@@ -172,8 +172,8 @@ body {
 /* --- BOTTOM MENU --- */
 .bottom-menu {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 10px;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 8px;
     background: none;
     padding: 0 0 env(safe-area-inset-bottom);
     border-radius: 32px;
@@ -498,6 +498,170 @@ body {
     }
 }
 
+/* --- IPAD MINI LANDSCAPE (≥1000px — iPad mini 5: 1024px, mini 6: ~1133px, ej iPhone) --- */
+/*
+   Tre-kolumns-layout:
+   [konst + meta] | [rum-väljare + transport] | [2×2 meny]
+*/
+@media (orientation: landscape) and (min-width: 1000px) {
+
+    /* ── Tre kolumner ─────────────────────────────────────── */
+    .app-container {
+        grid-template-columns: auto 1fr 256px;
+        grid-template-rows: auto 1fr;
+        grid-template-areas:
+            "art nav  menu"
+            "art ctrl menu";
+        gap: 12px 28px;
+        padding-top: calc(env(safe-area-inset-top) + 14px);
+        padding-bottom: calc(env(safe-area-inset-bottom) + 14px);
+        padding-left: calc(env(safe-area-inset-left) + 28px);
+        padding-right: calc(env(safe-area-inset-right) + 28px);
+        align-items: stretch;
+    }
+
+    /* ── Vänster kolumn: konstverk + låtinfo ──────────────── */
+    .player-core {
+        justify-content: center;
+        padding-top: 0;
+        padding-bottom: 0;
+    }
+
+    .artwork-wrapper {
+        width: calc(100vh - 80px);
+        height: calc(100vh - 80px);
+        max-width: 340px;
+        max-height: 340px;
+        border-radius: 38px;
+        margin-bottom: 14px;
+    }
+
+    .track-meta {
+        max-width: 100%;
+    }
+
+    .track-meta p {
+        font-size: 13px;
+        letter-spacing: 1.5px;
+    }
+
+    .track-meta h1 {
+        font-size: 26px;
+    }
+
+    /* ── Mitten: rum-väljare ──────────────────────────────── */
+    .top-nav {
+        align-items: flex-start;
+        padding: 0;
+    }
+
+    .top-nav-btn {
+        font-size: 14px;
+        min-height: 54px;
+        border-radius: 18px;
+    }
+
+    /* ── Mitten: transport + volym ───────────────────────── */
+    .controls-wrapper {
+        grid-area: ctrl;
+        padding-bottom: 0;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        gap: 0;
+    }
+
+    .main-transport {
+        margin-bottom: 26px;
+    }
+
+    .btn-play {
+        width: 96px;
+        height: 96px;
+    }
+
+    .btn-play svg {
+        width: 44px;
+        height: 44px;
+    }
+
+    .btn-secondary {
+        width: 68px;
+        height: 68px;
+    }
+
+    .btn-secondary svg {
+        width: 30px;
+        height: 30px;
+    }
+
+    /* ── Höger kolumn: 2×2 meny (spannar båda rader) ──────── */
+    .bottom-menu {
+        grid-area: menu;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 10px;
+        padding: 0;
+        align-self: stretch;
+    }
+
+    .menu-item {
+        min-height: 0;
+        border-radius: 22px;
+        flex-direction: column;
+        justify-content: center;
+    }
+
+    .menu-item svg {
+        width: 28px;
+        height: 28px;
+        margin-bottom: 10px;
+    }
+
+    .menu-item span {
+        font-size: 11px;
+        letter-spacing: 0.6px;
+    }
+
+    /* ── Modaler ──────────────────────────────────────────── */
+    .modal-glass {
+        bottom: 20px;
+        left: 16px;
+        right: 16px;
+        width: calc(100% - 32px);
+        height: 90vh;
+        border-radius: 32px;
+    }
+
+    #room-modal .modal-glass {
+        height: 90vh;
+        border-radius: 0 0 32px 32px;
+        padding-top: calc(env(safe-area-inset-top) + 24px);
+    }
+
+    .album-grid-container {
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        gap: 28px 14px;
+        padding: 8px 12px 50px;
+    }
+
+    .modal-title {
+        font-size: 20px;
+        padding: 28px 0 12px;
+    }
+
+    .close-btn-large {
+        width: 40%;
+        padding: 18px;
+        border-radius: 22px;
+        font-size: 17px;
+    }
+
+    .room-item {
+        font-size: 17px;
+        padding: 20px 24px;
+    }
+}
+
 /* --- SNYGGARE SCROLLBAR --- */
 
 /* 1. Definiera bredden på scrollbaren */
@@ -530,4 +694,53 @@ body {
 .room-list {
     scrollbar-width: thin;
     scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+}
+
+/* --- EDGAR TOAST --- */
+.edgar-toast {
+    position: fixed;
+    bottom: calc(130px + env(safe-area-inset-bottom));
+    left: 20px;
+    right: 20px;
+    background: rgba(25, 25, 30, 0.97);
+    backdrop-filter: blur(30px);
+    -webkit-backdrop-filter: blur(30px);
+    border: 1px solid rgba(255, 149, 0, 0.35);
+    border-radius: 22px;
+    padding: 14px 18px;
+    z-index: 900;
+    box-shadow: 0 0 24px rgba(255, 149, 0, 0.2);
+    transform: translateY(calc(100% + 20px));
+    transition: transform 0.38s cubic-bezier(0.2, 1, 0.3, 1), opacity 0.38s;
+    opacity: 0;
+    pointer-events: none;
+}
+
+.edgar-toast.visible {
+    transform: translateY(0);
+    opacity: 1;
+}
+
+.edgar-toast p {
+    margin: 0;
+    font-size: 14px;
+    line-height: 1.5;
+    color: white;
+}
+
+/* --- EDGAR LYSSNARTILLSTÅND --- */
+#edgar-btn.listening {
+    background: rgba(255, 149, 0, 0.18);
+    border-color: var(--accent);
+    color: var(--accent);
+    animation: edgar-pulse 1.2s ease-in-out infinite;
+}
+
+#edgar-btn.listening svg {
+    stroke: var(--accent);
+}
+
+@keyframes edgar-pulse {
+    0%, 100% { box-shadow: 0 0 12px rgba(255, 149, 0, 0.4); }
+    50%       { box-shadow: 0 0 28px rgba(255, 149, 0, 0.75); }
 }
