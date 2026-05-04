@@ -5,6 +5,9 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, send_from_directory, jsonify
 
+_session = requests.Session()
+_session.mount('http://', requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=10))
+
  
 CATEGORY_INDEX = {
     "artist":   0,
@@ -75,7 +78,7 @@ def set_c5_volume_upnp(volume_level):
 def lms_json_rpc(player_id, command_args):
     payload = {"id": 1, "method": "slim.request", "params": [player_id, command_args]}
     try:
-        return requests.post(LMS_URL, json=payload, timeout=3).json()
+        return _session.post(LMS_URL, json=payload, timeout=3).json()
     except Exception as e:
         print(f"[ERROR] LMS: {e}")
         return None
