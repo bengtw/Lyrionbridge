@@ -423,6 +423,8 @@ def get_title():
         return "Välj rum"
     res = lms_json_rpc(player_mac, ["status", "-", "1", "tags:atl"])
     try:
+        if res['result'].get('mode') != 'play':
+            return ""
         track = res['result']['playlist_loop'][0]
         title = track.get('title') or track.get('name', 'Ingen titel')
         artist = track.get('artist', '')
