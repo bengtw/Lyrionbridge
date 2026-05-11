@@ -30,7 +30,9 @@ EDGAR_URL = "http://127.0.0.1:5015"
 LMS_URL = f"http://{LMS_HOST}:9000/jsonrpc.js"
 C5_IP   = "10.0.1.125"
 C5_MAC  = "bb:bb:7a:f8:33:39"
-DEBUG   = os.getenv("BRIDGE_DEBUG", "").lower() == "true"
+DEBUG              = os.getenv("BRIDGE_DEBUG", "").lower() == "true"
+LASTFM_API_KEY     = os.getenv("LASTFM_API_KEY",  "9ed2b1dfa5c3f0ece0a30ec8e69b4742")
+LASTFM_USERNAME    = os.getenv("LASTFM_USERNAME", "LadoCasseta")
 
 FAVORITE_PLAYLISTS = [
     ("Background Jazz",      "spotify:playlist:37i9dQZF1DWV7EzJMK2FUI?si=e099779019b14bb7"),
@@ -236,6 +238,73 @@ def _query_player_status(p):
     loop = r.get('playlist_loop', [])
     track = {'title': loop[0].get('title', ''), 'artist': loop[0].get('artist', '')} if loop else {}
     return {'room': p.get('name'), 'mac': mac, 'mode': 'play', 'track': track}
+
+
+# --- LAST.FM LÄSNING ---
+
+_lastfm_taste_cache      = None
+_lastfm_taste_cache_time = 0
+_LASTFM_TASTE_TTL        = 900  # 15 minuter
+
+_lastfm_fail_counts: dict[str, int] = {}
+
+def _lastfm_get(method, **params):
+    """Läs-anrop mot Last.fm API (ingen signatur krävs)."""
+    if not LASTFM_API_KEY:
+        return None
+    try:
+        r = _session.get("https://ws.audioscrobbler.com/2.0/", params={
+            "method":  method,
+            "api_key": LASTFM_API_KEY,
+            "format":  "json",
+            **params,
+        }, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        if "error" in data:
+            _lastfm_fail_counts[method] = _lastfm_fail_counts.get(method, 0) + 1
+            print(f"[LastFM] {method} API-fel {data['error']}: {data.get('message', '')} (totalt {_lastfm_fail_counts[method]}x)")
+            return None
+        return data
+    except Exception as e:
+        _lastfm_fail_counts[method] = _lastfm_fail_counts.get(method, 0) + 1
+        print(f"[LastFM] {method} misslyckades: {e} (totalt {_lastfm_fail_counts[method]}x)")
+        return None
+
+def _get_lastfm_taste_profile():
+    """Returnerar en dict med top_artists och recent_tracks från Last.fm, med cache."""
+    global _lastfm_taste_cache, _lastfm_taste_cache_time
+    if _lastfm_taste_cache and _cache_valid(_lastfm_taste_cache_time, _LASTFM_TASTE_TTL):
+        return _lastfm_taste_cache
+
+    if not (LASTFM_API_KEY and LASTFM_USERNAME):
+        return None
+
+    top_resp    = _lastfm_get("user.getTopArtists", user=LASTFM_USERNAME, period="1month", limit=10)
+    recent_resp = _lastfm_get("user.getRecentTracks", user=LASTFM_USERNAME, limit=10)
+
+    def _as_list(val):
+        if isinstance(val, list):
+            return val
+        if isinstance(val, dict):
+            return [val]
+        return []
+
+    top_artists = []
+    if top_resp and "topartists" in top_resp:
+        top_artists = [a["name"] for a in _as_list(top_resp["topartists"].get("artist"))]
+
+    recent_tracks = []
+    if recent_resp and "recenttracks" in recent_resp:
+        for t in _as_list(recent_resp["recenttracks"].get("track")):
+            if not t.get("@attr", {}).get("nowplaying"):
+                recent_tracks.append(f"{t['name']} – {t['artist']['#text']}")
+        recent_tracks = list(dict.fromkeys(recent_tracks))[:8]
+
+    profile = {"top_artists": top_artists, "recent_tracks": recent_tracks}
+    _lastfm_taste_cache      = profile
+    _lastfm_taste_cache_time = time.time()
+    return profile
 
 
 # --- PWA SERVERING ---
@@ -913,15 +982,131 @@ def edgar_chat():
     if not message:
         return jsonify({"error": "Inget meddelande"}), 400
     _, room_name = get_player_info(data.get('room', ''))
+
+    taste = _get_lastfm_taste_profile()
+    user_context = ""
+    if taste and (taste["top_artists"] or taste["recent_tracks"]):
+        parts = []
+        if taste["top_artists"]:
+            parts.append("Favoritartister senaste månaden: " + ", ".join(taste["top_artists"]))
+        if taste["recent_tracks"]:
+            parts.append("Nyligen spelade låtar: " + "; ".join(taste["recent_tracks"]))
+        user_context = " | ".join(parts)
+
     try:
         resp = _session.post(f"{EDGAR_URL}/chat", json={
-            "message": message,
-            "client_id": "multilyrion",
+            "message":      message,
+            "client_id":    "multilyrion",
             "default_room": room_name,
+            "user_context": user_context,
         }, timeout=180)
         return jsonify(resp.json())
     except Exception as e:
         return jsonify({"error": str(e)}), 502
+
+@app.route('/lastfm_tag_artists')
+def lastfm_tag_artists():
+    """Toppkonstnärer för en Last.fm-tagg (genre/stämning)."""
+    tag = request.args.get('tag', '').strip()
+    if not tag:
+        return jsonify({"error": "tag saknas"}), 400
+    try:
+        limit = min(int(request.args.get('limit', '10')), 30)
+    except ValueError:
+        limit = 10
+    resp = _lastfm_get("tag.getTopArtists", tag=tag, limit=limit)
+    if not resp or "topartists" not in resp:
+        return jsonify({"tag": tag, "artists": []})
+    artists = [
+        {"name": a.get("name", ""), "rank": int(a.get("@attr", {}).get("rank", 0))}
+        for a in resp["topartists"].get("artist", [])
+    ]
+    return jsonify({"tag": tag, "artists": artists})
+
+@app.route('/lastfm_tag_tracks')
+def lastfm_tag_tracks():
+    """Topplåtar för en Last.fm-tagg (genre/stämning)."""
+    tag = request.args.get('tag', '').strip()
+    if not tag:
+        return jsonify({"error": "tag saknas"}), 400
+    try:
+        limit = min(int(request.args.get('limit', '15')), 30)
+    except ValueError:
+        limit = 15
+    resp = _lastfm_get("tag.getTopTracks", tag=tag, limit=limit)
+    if not resp or "tracks" not in resp:
+        return jsonify({"tag": tag, "tracks": []})
+    tracks = [
+        {"artist": t.get("artist", {}).get("name", ""), "title": t.get("name", "")}
+        for t in resp["tracks"].get("track", [])
+        if t.get("artist", {}).get("name") and t.get("name")
+    ]
+    return jsonify({"tag": tag, "tracks": tracks})
+
+@app.route('/lastfm_similar')
+def lastfm_similar():
+    """Liknande artister för en specifik artist via Last.fm."""
+    artist = request.args.get('artist', '').strip()
+    if not artist:
+        return jsonify({"error": "artist saknas"}), 400
+    try:
+        limit = min(int(request.args.get('limit', '10')), 30)
+    except ValueError:
+        limit = 10
+    resp = _lastfm_get("artist.getSimilar", artist=artist, limit=limit)
+    if not resp or "similarartists" not in resp:
+        return jsonify({"artist": artist, "similar": []})
+    similar = [
+        {"name": a.get("name", ""), "match": round(float(a.get("match", 0)) * 100)}
+        for a in resp["similarartists"].get("artist", [])
+    ]
+    return jsonify({"artist": artist, "similar": similar})
+
+@app.route('/lastfm_recommendations')
+def lastfm_recommendations():
+    """Liknande artister baserat på användarens top-artister den senaste månaden."""
+    taste = _get_lastfm_taste_profile()
+    if not taste or not taste["top_artists"]:
+        print(f"[LastFM] lastfm_recommendations: ingen smakprofil tillgänglig — returnerar tom data")
+        return jsonify({"based_on": [], "similar": []}), 200
+
+    try:
+        limit = min(int(request.args.get('limit', '5')), 20)
+    except ValueError:
+        limit = 5
+
+    seen      = {a.lower() for a in taste["top_artists"]}
+    similar   = []
+
+    for artist in taste["top_artists"][:5]:
+        resp = _lastfm_get("artist.getSimilar", artist=artist, limit=10)
+        if not resp or "similarartists" not in resp:
+            continue
+        for a in resp["similarartists"].get("artist", []):
+            name = a.get("name", "")
+            if name.lower() not in seen:
+                seen.add(name.lower())
+                similar.append({
+                    "name":     name,
+                    "based_on": artist,
+                    "match":    round(float(a.get("match", 0)) * 100),
+                })
+            if len(similar) >= limit * 3:
+                break
+
+    similar.sort(key=lambda x: x["match"], reverse=True)
+    return jsonify({
+        "based_on":   taste["top_artists"][:5],
+        "similar":    similar[:limit],
+    })
+
+@app.route('/lastfm_profile')
+def lastfm_profile():
+    """Returnerar användarens Last.fm-smakprofil (top-artister + senast spelade)."""
+    taste = _get_lastfm_taste_profile()
+    if not taste:
+        return jsonify({"error": "LASTFM_API_KEY eller LASTFM_USERNAME saknas"}), 503
+    return jsonify(taste)
 
 @app.route('/spy')
 def spy():
@@ -963,6 +1148,69 @@ def list_playlists_local():
             glob.glob(os.path.join(PLAYLIST_DIR, "*.m3u8"))
     names = [os.path.splitext(os.path.basename(f))[0] for f in sorted(files)]
     return jsonify(names)
+
+
+@app.route('/spotify_recommendations')
+def spotify_recommendations():
+    """Artistrekommendationer baserat på seed-artister och/eller genrer.
+
+    Query-parametrar:
+        artist  = seed-artist (kan upprepas, max 5 används)
+        genre   = seed-genre/tagg (kan upprepas, max 3 används)
+        limit   = antal rekommenderade artister att returnera (default 20)
+
+    Strategi:
+        - För varje seed-artist: hämta Last.fm similar artists
+        - För varje seed-genre: hämta Last.fm tag top artists
+        - Kombinera, deduplicera mot seeds, returnera rankad lista
+    """
+    seed_artists = request.args.getlist('artist')[:5]
+    seed_genres  = request.args.getlist('genre')[:3]
+    try:
+        limit = min(int(request.args.get('limit', '20')), 50)
+    except ValueError:
+        limit = 20
+
+    if not seed_artists and not seed_genres:
+        return jsonify({"error": "Minst en artist eller genre krävs"}), 400
+
+    seen    = {a.lower() for a in seed_artists}
+    results = []
+
+    for artist in seed_artists:
+        resp = _lastfm_get("artist.getSimilar", artist=artist, limit=10)
+        if not resp or "similarartists" not in resp:
+            continue
+        for a in resp["similarartists"].get("artist", []):
+            name = a.get("name", "").strip()
+            if not name or name.lower() in seen:
+                continue
+            seen.add(name.lower())
+            results.append({
+                "artist": name,
+                "match":  round(float(a.get("match", 0)) * 100),
+                "source": "lastfm_similar",
+                "seed":   artist,
+            })
+
+    for genre in seed_genres:
+        resp = _lastfm_get("tag.getTopArtists", tag=genre, limit=15)
+        if not resp or "topartists" not in resp:
+            continue
+        for a in resp["topartists"].get("artist", []):
+            name = a.get("name", "").strip()
+            if not name or name.lower() in seen:
+                continue
+            seen.add(name.lower())
+            results.append({
+                "artist": name,
+                "match":  0,
+                "source": "lastfm_tag",
+                "seed":   genre,
+            })
+
+    results.sort(key=lambda x: x["match"], reverse=True)
+    return jsonify({"recommendations": results[:limit]})
 
 
 if __name__ == '__main__':
