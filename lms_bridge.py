@@ -103,13 +103,26 @@ def set_c5_volume_upnp(volume_level):
     except Exception as e:
         print(f"[UPNP ERROR] C5: {e}")
 
-def lms_json_rpc(player_id, command_args):
+def lms_json_rpc(player_id, command_args, timeout=3):
     payload = {"id": 1, "method": "slim.request", "params": [player_id, command_args]}
     try:
-        return _session.post(LMS_URL, json=payload, timeout=3).json()
+        return _session.post(LMS_URL, json=payload, timeout=timeout).json()
     except Exception as e:
         print(f"[ERROR] LMS: {e}")
         return None
+
+def _deferred_kick(player_mac, delay=5.0):
+    """Väntar delay sekunder, kollar om spelaren faktiskt spelar — annars kickar vi igång den."""
+    def _kick():
+        time.sleep(delay)
+        res = lms_json_rpc(player_mac, ["status", "-", 1, "tags:"])
+        if res:
+            mode = res.get("result", {}).get("mode")
+            playlist_tracks = res.get("result", {}).get("playlist_tracks", 0)
+            if mode != "play" and playlist_tracks > 0:
+                print(f"[KICK] {player_mac} mode={mode!r} men {playlist_tracks} spår i kön — kickar igång")
+                lms_json_rpc(player_mac, ["play"])
+    threading.Thread(target=_kick, daemon=True).start()
 
 def lms_play_stream(player_mac, play_command):
     """stop → clear → play → shuffle on (för URLs och daily mixes)"""
@@ -117,6 +130,7 @@ def lms_play_stream(player_mac, play_command):
     lms_json_rpc(player_mac, ["playlist", "clear"])
     result = lms_json_rpc(player_mac, play_command)
     lms_json_rpc(player_mac, ["playlist", "shuffle", 1])
+    _deferred_kick(player_mac)
     return result
 
 def lms_play_playlist(player_mac, url):
@@ -129,6 +143,7 @@ def lms_play_playlist(player_mac, url):
     lms_json_rpc(player_mac, ["playlist", "shuffle", 1])
     lms_json_rpc(player_mac, ["playlist", "index", "+1"])
     lms_json_rpc(player_mac, ["play"])
+    _deferred_kick(player_mac)
     return res
 
 def lms_load_album(player_mac, album_id):
@@ -184,7 +199,7 @@ def get_player_info(room_arg):
 def _fetch_daily_mixes_raw():
     """Hämtar råa Spotty-items från startsidan (Daily Mixes, Radar, Discovery, etc.)."""
     player_mac = _any_player_mac()
-    res = lms_json_rpc(player_mac, ["spotty", "items", 0, 80, "item_id:0", "menu:1", "tags:s"])
+    res = lms_json_rpc(player_mac, ["spotty", "items", 0, 80, "item_id:0", "menu:1", "tags:s"], timeout=35)
     if res and 'result' in res:
         return res['result'].get('item_loop', [])
     return []
@@ -874,23 +889,59 @@ def spotify_artist_top():
     if not query:
         return jsonify({"error": "Missing q"}), 400
 
-    search_res = lms_json_rpc(player_mac, ["spotty", "items", 0, 5, "item_id:1.0", f"search:{query}"])
+    _spotty = 35
+
+    search_res = lms_json_rpc(player_mac, ["spotty", "items", 0, 5, "item_id:1.0", f"search:{query}"], timeout=_spotty)
     if not search_res or 'result' not in search_res:
         return jsonify({"error": "Sökning misslyckades"}), 500
 
     loop = search_res['result'].get('loop_loop', [])
-    artist_cat = next((it for it in loop if "Artists" in it.get('text', '')), None)
+    artist_cat = next((it for it in loop if "Artists" in it.get('name', '')), None)
     if not artist_cat:
         return jsonify({"error": "Ingen artist-kategori hittades"}), 404
 
-    artists = lms_json_rpc(player_mac, ["spotty", "items", 0, 1, f"item_id:{artist_cat['id']}"])
+    artists = lms_json_rpc(player_mac, ["spotty", "items", 0, 1, f"item_id:{artist_cat['id']}"], timeout=_spotty)
     if not artists or not artists.get('result', {}).get('loop_loop'):
         return jsonify({"error": "Artisten hittades inte i listan"}), 404
 
     artist_id = artists['result']['loop_loop'][0]['id']
-    tracks_res = lms_json_rpc(player_mac, ["spotty", "items", 0, 10, f"item_id:{artist_id}.0"])
+    tracks_res = lms_json_rpc(player_mac, ["spotty", "items", 0, 10, f"item_id:{artist_id}.0"], timeout=_spotty)
     items = tracks_res.get('result', {}).get('loop_loop', []) if tracks_res else []
     return jsonify([_format_track(it) for it in items if it.get('isaudio')])
+
+@app.route('/spotify_artist_radio')
+def spotify_artist_radio():
+    """Returnerar Artist Radio-item-ID för en artist via Spotty (Spotifys egna radioalgoritm)."""
+    query = request.args.get('q', '').strip()
+    player_mac, _ = get_player_info(request.args.get('room'))
+
+    if not query:
+        return jsonify({"error": "Missing q"}), 400
+
+    _spotty = 35  # Spotty-anrop kan ta lång tid när Spotify API är trög
+
+    search_res = lms_json_rpc(player_mac, ["spotty", "items", 0, 5, "item_id:1.0", f"search:{query}"], timeout=_spotty)
+    if not search_res or 'result' not in search_res:
+        return jsonify({"error": "Sökning misslyckades"}), 500
+
+    loop = search_res['result'].get('loop_loop', [])
+    artist_cat = next((it for it in loop if "Artists" in it.get('name', '')), None)
+    if not artist_cat:
+        return jsonify({"error": "Ingen artist-kategori hittades"}), 404
+
+    artists = lms_json_rpc(player_mac, ["spotty", "items", 0, 1, f"item_id:{artist_cat['id']}"], timeout=_spotty)
+    if not artists or not artists.get('result', {}).get('loop_loop'):
+        return jsonify({"error": "Artisten hittades inte"}), 404
+
+    artist_id = artists['result']['loop_loop'][0]['id']
+
+    root_res   = lms_json_rpc(player_mac, ["spotty", "items", 0, 20, f"item_id:{artist_id}"], timeout=_spotty)
+    root_items = root_res.get('result', {}).get('loop_loop', []) if root_res else []
+    radio      = next((it for it in root_items if "Radio" in it.get('name', '')), None)
+    if not radio:
+        return jsonify({"error": "Ingen artist-radio hittades"}), 404
+
+    return jsonify({"id": radio['id'], "name": radio.get('name', 'Artist Radio')})
 
 @app.route('/spotify_genres')
 def spotify_genres():
