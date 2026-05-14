@@ -1388,7 +1388,36 @@ def listening_stats_endpoint():
 @app.route('/play_history_data')
 def play_history_data_endpoint():
     """Returnerar komplett plays-data för history-sidan."""
-    return jsonify(_lms_logger().history_data())
+    import sqlite3 as _sqlite3, time as _time
+    db_path = Path(__file__).parent / "play_history.db"
+    since_14 = int(_time.time()) - 14 * 86400
+    since_30 = int(_time.time()) - 30 * 86400
+    with _sqlite3.connect(db_path) as conn:
+        conn.row_factory = _sqlite3.Row
+        plays = [dict(r) for r in conn.execute(
+            "SELECT ts, player, artist, title, source, energy, valence, danceability, tempo, skipped "
+            "FROM plays ORDER BY ts DESC LIMIT 150"
+        ).fetchall()]
+        profile_row = conn.execute(
+            "SELECT AVG(energy) e, AVG(valence) v, AVG(danceability) d, AVG(tempo) t, COUNT(*) n "
+            "FROM plays WHERE ts >= ? AND skipped=0 AND energy IS NOT NULL",
+            (since_14,)
+        ).fetchone()
+        profile = dict(profile_row) if profile_row and profile_row["n"] else None
+        top_artists = [dict(r) for r in conn.execute(
+            "SELECT artist, COUNT(*) plays, AVG(energy) avg_energy "
+            "FROM plays WHERE ts >= ? AND skipped=0 AND artist != '' "
+            "GROUP BY lower(artist) ORDER BY plays DESC LIMIT 20",
+            (since_30,)
+        ).fetchall()]
+        energy_dist = [0] * 10
+        for r in conn.execute(
+            "SELECT energy FROM plays WHERE ts >= ? AND energy IS NOT NULL AND skipped=0",
+            (since_30,)
+        ).fetchall():
+            bucket = min(int(r["energy"] * 10), 9)
+            energy_dist[bucket] += 1
+    return jsonify(plays=plays, profile=profile, top_artists=top_artists, energy_dist=energy_dist)
 
 
 if __name__ == '__main__':
