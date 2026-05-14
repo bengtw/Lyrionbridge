@@ -1,12 +1,15 @@
+import json
 import os
 import re
 import glob
 import logging
+import sqlite3
 import threading
 import requests
 import random
 import time
 import urllib.parse
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, send_from_directory, jsonify
 
@@ -42,6 +45,47 @@ FAVORITE_PLAYLISTS = [
     ("Dinner with Friends",  "spotify:playlist:37i9dQZF1DX4xuWVBs4FgJ?si=7c1574dfb25d4117"),
     ("Coffee Table Jazz",    "spotify:playlist:37i9dQZF1DWVqfgj8NZEp1?si=f90718546eb4492f")
 ]
+
+_SEARCH_CACHE_DB   = Path(__file__).parent / "metadata_cache.db"
+_SEARCH_TTL_TRACK  = 30 * 86400   # 30 dagar — spår ändras sällan
+_SEARCH_TTL_OTHER  = 7  * 86400   # 7 dagar  — album/artist/playlist
+
+
+def _init_search_cache():
+    with sqlite3.connect(_SEARCH_CACHE_DB) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS search_cache (
+                query     TEXT    NOT NULL,
+                type      TEXT    NOT NULL,
+                limit_n   INTEGER NOT NULL,
+                results   TEXT    NOT NULL,
+                cached_at INTEGER NOT NULL,
+                PRIMARY KEY (query, type, limit_n)
+            )
+        """)
+
+
+_init_search_cache()
+
+
+def _search_cache_get(query: str, search_type: str, limit: int):
+    ttl    = _SEARCH_TTL_TRACK if search_type == "track" else _SEARCH_TTL_OTHER
+    cutoff = int(time.time()) - ttl
+    with sqlite3.connect(_SEARCH_CACHE_DB) as conn:
+        row = conn.execute(
+            "SELECT results FROM search_cache WHERE query=? AND type=? AND limit_n=? AND cached_at>?",
+            (query, search_type, limit, cutoff),
+        ).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def _search_cache_set(query: str, search_type: str, limit: int, results: list):
+    with sqlite3.connect(_SEARCH_CACHE_DB) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO search_cache (query, type, limit_n, results, cached_at) VALUES (?,?,?,?,?)",
+            (query, search_type, limit, json.dumps(results), int(time.time())),
+        )
+
 
 _playlist_art_cache = []
 _playlist_art_cache_time = 0
@@ -814,6 +858,10 @@ def spotify_search():
         limit = 10
     limit = max(1, min(limit, 50))
 
+    cached = _search_cache_get(query, search_type, limit)
+    if cached is not None:
+        return jsonify({"query": query, "type": search_type, "items": cached, "cached": True})
+
     player_mac, _ = get_player_info(request.args.get('room'))
 
     initial = lms_json_rpc(player_mac, [
@@ -846,10 +894,13 @@ def spotify_search():
 
         formatted = [_format_entry(it, search_type) for it in sub['result'].get('loop_loop', [])[:limit]]
 
+    items_out = [f for f in formatted if f]
+    if items_out:
+        _search_cache_set(query, search_type, limit, items_out)
     return jsonify({
         "query": query,
         "type": search_type,
-        "items": [f for f in formatted if f],
+        "items": items_out,
     })
 
 
@@ -905,7 +956,18 @@ def spotify_artist_top():
         return jsonify({"error": "Artisten hittades inte i listan"}), 404
 
     artist_id = artists['result']['loop_loop'][0]['id']
-    tracks_res = lms_json_rpc(player_mac, ["spotty", "items", 0, 10, f"item_id:{artist_id}.0"], timeout=_spotty)
+
+    # Hämta artist-menyn och hitta "Top Tracks" (eller liknande) by name
+    menu_res   = lms_json_rpc(player_mac, ["spotty", "items", 0, 10, f"item_id:{artist_id}"], timeout=_spotty)
+    menu_items = menu_res.get('result', {}).get('loop_loop', []) if menu_res else []
+    top_item   = next(
+        (it for it in menu_items if any(k in it.get('name', '') for k in ("Top", "Populär", "Popular"))),
+        menu_items[0] if menu_items else None,
+    )
+    if not top_item:
+        return jsonify({"error": "Ingen spårmeny hittades för artisten"}), 404
+
+    tracks_res = lms_json_rpc(player_mac, ["spotty", "items", 0, 10, f"item_id:{top_item['id']}"], timeout=_spotty)
     items = tracks_res.get('result', {}).get('loop_loop', []) if tracks_res else []
     return jsonify([_format_track(it) for it in items if it.get('isaudio')])
 
@@ -1262,6 +1324,71 @@ def spotify_recommendations():
 
     results.sort(key=lambda x: x["match"], reverse=True)
     return jsonify({"recommendations": results[:limit]})
+
+
+# ---------------------------------------------------------------------------
+# Spelhistorik-endpoints (delegerar till lms_logger)
+# ---------------------------------------------------------------------------
+
+def _lms_logger():
+    """Lazy-importerar lms_logger från samma katalog."""
+    import importlib.util, sys
+    if "lms_logger" not in sys.modules:
+        spec = importlib.util.spec_from_file_location(
+            "lms_logger", Path(__file__).parent / "lms_logger.py"
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        sys.modules["lms_logger"] = mod
+    return sys.modules["lms_logger"]
+
+
+@app.route('/recent_artists')
+def recent_artists_endpoint():
+    try:
+        limit = int(request.args.get('limit', 40))
+        days  = int(request.args.get('days', 30))
+    except ValueError:
+        limit, days = 40, 30
+    artists = _lms_logger().recent_artists(limit=limit, days=days)
+    return jsonify(artists)
+
+
+@app.route('/recent_tracks')
+def recent_tracks_endpoint():
+    try:
+        limit = int(request.args.get('limit', 100))
+        days  = int(request.args.get('days', 14))
+    except ValueError:
+        limit, days = 100, 14
+    tracks = _lms_logger().recent_tracks(limit=limit, days=days)
+    return jsonify(tracks)
+
+
+@app.route('/skipped_tracks')
+def skipped_tracks_endpoint():
+    try:
+        limit = int(request.args.get('limit', 50))
+        days  = int(request.args.get('days', 14))
+    except ValueError:
+        limit, days = 50, 14
+    tracks = _lms_logger().skipped_tracks(limit=limit, days=days)
+    return jsonify(tracks)
+
+
+@app.route('/listening_stats')
+def listening_stats_endpoint():
+    try:
+        days = int(request.args.get('days', 30))
+    except ValueError:
+        days = 30
+    return jsonify(_lms_logger().listening_stats(days=days))
+
+
+@app.route('/play_history_data')
+def play_history_data_endpoint():
+    """Returnerar komplett plays-data för history-sidan."""
+    return jsonify(_lms_logger().history_data())
 
 
 if __name__ == '__main__':
