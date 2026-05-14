@@ -18,7 +18,7 @@ _session.mount('http://', requests.adapters.HTTPAdapter(pool_connections=4, pool
 
 CATEGORY_INDEX = {
     "artist":   0,
-    "album":    1,
+    "track":    1,
     "playlist": 2,
     "podcast":  3,
     "episode":  4,
@@ -841,9 +841,9 @@ def spotify_search():
         limit  = antal träffar (default 10)
 
     Spotty-hierarki vi navigerar:
-        item_id:0.0 + search:<q>          = Direkta spår (audioträffar, inga kategorier)
-        item_id:1.0 + search:<q>          = Kategorilista (Artists, Albums, Playlists …)
-        item_id:1.0_<q>.N                 = gå in i kategori N (t.ex. N=0 → Artists)
+        item_id:1.0_<q>.N                 = gå in i kategori N direkt:
+                                            0=Artists, 1=Tracks, 2=Playlists,
+                                            3=Podcasts, 4=Episodes
     """
     query = request.args.get('q', '').strip()
     if not query:
@@ -862,36 +862,67 @@ def spotify_search():
 
     player_mac, _ = get_player_info(request.args.get('room'))
 
-    if search_type == "track":
-        # item_id:0.0 ger direkta audio-träffar utan kategorinavigering
-        initial = lms_json_rpc(player_mac, [
-            "spotty", "items", 0, 50,
-            "item_id:0.0",
-            f"search:{query}",
-        ])
-        if not initial or 'result' not in initial:
-            return jsonify({"query": query, "type": search_type, "items": []})
-        loop = initial['result'].get('loop_loop', [])
-        items = [it for it in loop if it.get('isaudio') == 1]
-        formatted = [_format_track(it) for it in items[:limit]]
-    else:
-        # item_id:1.0 ger kategorier (Artists, Albums, Playlists …)
-        cat_idx = CATEGORY_INDEX.get(search_type)
-        if cat_idx is None:
-            return jsonify({"error": f"Unknown type: {search_type}"}), 400
+    cat_idx = CATEGORY_INDEX.get(search_type)
+    if cat_idx is None:
+        return jsonify({"error": f"Unknown type: {search_type}"}), 400
 
-        encoded = urllib.parse.quote(query)
+    # item_id:1.0_{query}.N navigerar in i kategori N:
+    # 0=Artists, 1=Tracks, 2=Playlists, 3=Podcasts, 4=Episodes
+    encoded = urllib.parse.quote(query)
+
+    if search_type == "track":
+        # Kategori 1 returnerar album som innehåller matchande spår.
+        # Hämta 5 album, välj bäst matchande spår per album för att undvika
+        # att karaoke/covers-album i position 0 dominerar hela träfflistan.
+        albums_res = lms_json_rpc(player_mac, [
+            "spotty", "items", 0, 5,
+            f"item_id:1.0_{encoded}.{cat_idx}",
+        ])
+        albums = (albums_res or {}).get("result", {}).get("loop_loop", [])[:5]
+        if not albums:
+            return jsonify({"query": query, "type": search_type, "items": []})
+
+        def _get_album_tracks(album_id):
+            r = lms_json_rpc(player_mac, ["spotty", "items", 0, 50, f"item_id:{album_id}"])
+            return (r or {}).get("result", {}).get("loop_loop", [])
+
+        with ThreadPoolExecutor(max_workers=min(len(albums), 3)) as ex:
+            track_lists = list(ex.map(_get_album_tracks, [a["id"] for a in albums]))
+
+        query_words = {w for w in query.lower().split() if len(w) > 1}
+
+        def _best_in_album(tracks):
+            """Returnerar bäst matchande spår från ett album, filtrerar kontextmenyposter."""
+            candidates = []
+            for t in tracks:
+                fmt = _format_track(t)
+                if not fmt:
+                    continue
+                # Kontextmenyposter saknar artist-info i subtitle
+                if not fmt.get("subtitle", "").strip(" —"):
+                    continue
+                name_words = {w for w in fmt["name"].lower().split() if len(w) > 1}
+                score = len(query_words & name_words)
+                candidates.append((score, fmt))
+            if not candidates:
+                return None
+            candidates.sort(key=lambda x: -x[0])
+            best = candidates[0][1]
+            best["name"] = re.sub(r'^\d+\.\s*', '', best["name"])
+            best["uri"] = best["uri"] + ".0"
+            return best
+
+        formatted = [_best_in_album(tracks) for tracks in track_lists]
+    else:
         sub = lms_json_rpc(player_mac, [
             "spotty", "items", 0, limit,
             f"item_id:1.0_{encoded}.{cat_idx}",
         ])
-
         if not sub or 'result' not in sub:
             return jsonify({"query": query, "type": search_type, "items": []})
-
         formatted = [_format_entry(it, search_type) for it in sub['result'].get('loop_loop', [])[:limit]]
 
-    items_out = [f for f in formatted if f]
+    items_out = [f for f in formatted if f][:limit]
     if items_out:
         _search_cache_set(query, search_type, limit, items_out)
     return jsonify({
