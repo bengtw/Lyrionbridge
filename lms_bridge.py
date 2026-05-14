@@ -874,7 +874,12 @@ def spotify_search():
 
     if search_type == "track":
         items = [it for it in loop if it.get('isaudio') == 1]
-        formatted = [_format_track(it) for it in items[:limit]]
+        formatted = []
+        for it in items[:limit]:
+            fmt = _format_track(it)
+            if fmt:
+                fmt["uri"] = fmt["uri"] + ".0"
+                formatted.append(fmt)
     else:
         cat_idx = CATEGORY_INDEX.get(search_type)
         if cat_idx is None:
