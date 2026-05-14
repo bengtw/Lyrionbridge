@@ -472,6 +472,48 @@ def history_data():
     }
 
 
+def _listen():
+    while True:
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((LMS_HOST, LMS_CLI_PORT))
+            sock.sendall(b"subscribe playlist,stop,pause\n")
+            print(f"[LMS Logger] Ansluten till {LMS_HOST}:{LMS_CLI_PORT}")
+
+            buf = ""
+            while True:
+                chunk = sock.recv(4096).decode("utf-8", errors="replace")
+                if not chunk:
+                    break
+                buf += chunk
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = line.split(" ")
+                    mac = urllib.parse.unquote(parts[0])
+                    if len(parts) >= 3 and parts[1] == "playlist" and parts[2] == "newsong":
+                        threading.Thread(target=_on_newsong, args=(mac,), daemon=True).start()
+                    elif len(parts) >= 2 and parts[1] == "stop":
+                        threading.Thread(target=_on_stop, args=(mac,), daemon=True).start()
+                    elif len(parts) >= 3 and parts[1] == "playlist" and parts[2] == "stop":
+                        threading.Thread(target=_on_stop, args=(mac,), daemon=True).start()
+                    elif len(parts) >= 3 and parts[1] == "pause" and parts[2] == "1":
+                        threading.Thread(target=_on_stop, args=(mac,), daemon=True).start()
+
+        except Exception as e:
+            print(f"[LMS Logger] Anslutningsfel: {e} — försöker igen om 15s")
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+        time.sleep(15)
+
+
 # ---------------------------------------------------------------------------
 # Startpunkt
 # ---------------------------------------------------------------------------
