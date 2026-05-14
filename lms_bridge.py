@@ -841,10 +841,9 @@ def spotify_search():
         limit  = antal träffar (default 10)
 
     Spotty-hierarki vi navigerar:
-        item_id:0.0 + search:<q>          = Ny sökning (träfflista)
-          - items 0-5: kategorier (Artists, Albums, Playlists, ...)
-          - items 6+:  direkta spår
-        item_id:0.0_<q>.N                 = gå in i kategori N
+        item_id:0.0 + search:<q>          = Direkta spår (audioträffar, inga kategorier)
+        item_id:1.0 + search:<q>          = Kategorilista (Artists, Albums, Playlists …)
+        item_id:1.0_<q>.N                 = gå in i kategori N (t.ex. N=0 → Artists)
     """
     query = request.args.get('q', '').strip()
     if not query:
@@ -863,21 +862,20 @@ def spotify_search():
 
     player_mac, _ = get_player_info(request.args.get('room'))
 
-    initial = lms_json_rpc(player_mac, [
-        "spotty", "items", 0, 50,
-        "item_id:0.0",
-        f"search:{query}",
-    ])
-
-    if not initial or 'result' not in initial:
-        return jsonify({"query": query, "type": search_type, "items": []})
-
-    loop = initial['result'].get('loop_loop', [])
-
     if search_type == "track":
+        # item_id:0.0 ger direkta audio-träffar utan kategorinavigering
+        initial = lms_json_rpc(player_mac, [
+            "spotty", "items", 0, 50,
+            "item_id:0.0",
+            f"search:{query}",
+        ])
+        if not initial or 'result' not in initial:
+            return jsonify({"query": query, "type": search_type, "items": []})
+        loop = initial['result'].get('loop_loop', [])
         items = [it for it in loop if it.get('isaudio') == 1]
         formatted = [_format_track(it) for it in items[:limit]]
     else:
+        # item_id:1.0 ger kategorier (Artists, Albums, Playlists …)
         cat_idx = CATEGORY_INDEX.get(search_type)
         if cat_idx is None:
             return jsonify({"error": f"Unknown type: {search_type}"}), 400
@@ -885,7 +883,7 @@ def spotify_search():
         encoded = urllib.parse.quote(query)
         sub = lms_json_rpc(player_mac, [
             "spotty", "items", 0, limit,
-            f"item_id:0.0_{encoded}.{cat_idx}",
+            f"item_id:1.0_{encoded}.{cat_idx}",
         ])
 
         if not sub or 'result' not in sub:
@@ -941,7 +939,7 @@ def spotify_artist_top():
 
     _spotty = 35
 
-    search_res = lms_json_rpc(player_mac, ["spotty", "items", 0, 5, "item_id:0.0", f"search:{query}"], timeout=_spotty)
+    search_res = lms_json_rpc(player_mac, ["spotty", "items", 0, 5, "item_id:1.0", f"search:{query}"], timeout=_spotty)
     if not search_res or 'result' not in search_res:
         return jsonify({"error": "Sökning misslyckades"}), 500
 
@@ -981,7 +979,7 @@ def spotify_artist_radio():
 
     _spotty = 35  # Spotty-anrop kan ta lång tid när Spotify API är trög
 
-    search_res = lms_json_rpc(player_mac, ["spotty", "items", 0, 5, "item_id:0.0", f"search:{query}"], timeout=_spotty)
+    search_res = lms_json_rpc(player_mac, ["spotty", "items", 0, 5, "item_id:1.0", f"search:{query}"], timeout=_spotty)
     if not search_res or 'result' not in search_res:
         return jsonify({"error": "Sökning misslyckades"}), 500
 
