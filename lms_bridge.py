@@ -249,9 +249,9 @@ def _fetch_daily_mixes_raw():
     return []
 
 
-def _format_track(item):
+def _format_track(item, stable_uri=None):
     name = item.get('name', '')
-    uri = item.get('id', '')
+    uri = stable_uri or (item.get('id', '') + '.0')
 
     title, artist, album = name, "", ""
     if ' by ' in name:
@@ -267,6 +267,20 @@ def _format_track(item):
         "uri": uri,
         "art": _abs_image(item.get('image', '')),
     }
+
+
+def _get_stable_spotify_uri(item_id, player_mac):
+    """Borrar ner till leaf-noden och returnerar stabil spotify://track:XXXX-URI.
+    Försöker upp till 2 gånger med 8 sekunders timeout."""
+    for _ in range(2):
+        sub = lms_json_rpc(player_mac, ["spotty", "items", 0, 1, f"item_id:{item_id}"], timeout=8)
+        if sub and 'result' in sub:
+            loop = sub['result'].get('loop_loop', [])
+            if loop:
+                name = loop[0].get('name', '')
+                if name.startswith('spotify://'):
+                    return name
+    return None
 
 def _format_entry(item, search_type):
     """Formattera album/artist/playlist-träff från kategori-undermenyn."""
@@ -428,15 +442,15 @@ def play_url():
     elif "spotify:playlist:" in clean_url:
         res = lms_play_playlist(player_mac, clean_url)
 
-    # --- SÖKRESULTAT / ENKLA LÅTAR ---
-    elif clean_url.startswith("1.0_") or "spotify:track:" in clean_url:
+    # --- ENKLA LÅTAR: Spotty-sökresultat eller stabil spotify:// URI ---
+    elif clean_url.startswith("1.0_") or "spotify:track:" in clean_url or clean_url.startswith("spotify://track:"):
         lms_json_rpc(player_mac, ["playlist", "shuffle", 0])
         lms_json_rpc(player_mac, ["stop"])
         lms_json_rpc(player_mac, ["playlist", "clear"])
         if clean_url.startswith("1.0_"):
             res = lms_json_rpc(player_mac, ["spotty", "playlist", "play", f"item_id:{clean_url}"])
         else:
-            res = lms_json_rpc(player_mac, ["playlist", "play", clean_url, "1"])
+            res = lms_json_rpc(player_mac, ["playlist", "play", clean_url])
 
     else:
         res = lms_play_stream(player_mac, ["playlist", "play", clean_url])
@@ -861,25 +875,32 @@ def spotify_search():
 
     player_mac, _ = get_player_info(request.args.get('room'))
 
-    initial = lms_json_rpc(player_mac, [
-        "spotty", "items", 0, 50,
-        "item_id:1.0",
-        f"search:{query}",
-    ])
+    loop = []
+    for _attempt in range(3):
+        initial = lms_json_rpc(player_mac, [
+            "spotty", "items", 0, 50,
+            "item_id:1.0",
+            f"search:{query}",
+        ], timeout=10)
+        if initial and 'result' in initial:
+            loop = initial['result'].get('loop_loop', [])
+            if loop:
+                break
+        if _attempt < 2:
+            time.sleep(0.4 * (_attempt + 1))
 
-    if not initial or 'result' not in initial:
+    if not loop:
         return jsonify({"query": query, "type": search_type, "items": []})
 
-    loop = initial['result'].get('loop_loop', [])
-
     if search_type == "track":
-        items = [it for it in loop if it.get('isaudio') == 1]
-        formatted = []
-        for it in items[:limit]:
-            fmt = _format_track(it)
-            if fmt:
-                fmt["uri"] = fmt["uri"] + ".0"
-                formatted.append(fmt)
+        audio_items = [it for it in loop if it.get('isaudio') == 1][:limit]
+
+        def _resolve_item(it):
+            stable = _get_stable_spotify_uri(it.get('id', ''), player_mac)
+            return _format_track(it, stable_uri=stable)
+
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            formatted = list(ex.map(_resolve_item, audio_items))
     else:
         cat_idx = CATEGORY_INDEX.get(search_type)
         if cat_idx is None:
