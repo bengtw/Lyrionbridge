@@ -12,6 +12,18 @@ import urllib.parse
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, send_from_directory, jsonify
+def _load_dotenv(path):
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    k, _, v = line.partition('=')
+                    os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    except FileNotFoundError:
+        pass
+
+_load_dotenv(Path(__file__).parent.parent / "edgar" / ".env")
 
 _session = requests.Session()
 _session.mount('http://', requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=10))
@@ -49,6 +61,7 @@ FAVORITE_PLAYLISTS = [
 _SEARCH_CACHE_DB   = Path(__file__).parent / "metadata_cache.db"
 _SEARCH_TTL_TRACK  = 30 * 86400   # 30 dagar — spår ändras sällan
 _SEARCH_TTL_OTHER  = 7  * 86400   # 7 dagar  — album/artist/playlist
+_MIX_LABEL_TTL     = 6  * 3600    # 6 timmar — daily mixes byts ut dagligen
 
 
 def _init_search_cache():
@@ -63,9 +76,101 @@ def _init_search_cache():
                 PRIMARY KEY (query, type, limit_n)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS mix_labels (
+                mix_id    INTEGER PRIMARY KEY,
+                label     TEXT    NOT NULL,
+                cached_at INTEGER NOT NULL
+            )
+        """)
 
 
 _init_search_cache()
+
+_gemini_client = None
+_gemini_lock   = threading.Lock()
+
+def _get_gemini():
+    global _gemini_client
+    if _gemini_client:
+        return _gemini_client
+    with _gemini_lock:
+        if _gemini_client:
+            return _gemini_client
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            return None
+        from google import genai
+        _gemini_client = genai.Client(api_key=api_key)
+    return _gemini_client
+
+
+def _get_mix_label(artists_text: str) -> str | None:
+    """Frågar Gemini om 1-2 ord som sammanfattar stämningen hos dessa artister."""
+    client = _get_gemini()
+    if not client:
+        return None
+    prompt = (
+        f"Artister: {artists_text}\n\n"
+        "Ge ett label på 1–2 ord på svenska som hjälper användaren känna igen den här spellistan. "
+        "Föredra konkreta genrebeteckningar, eror eller stilar framför abstrakta känsloord. "
+        "Exempel på bra svar: 'Brittisk indie', 'EBM-klubb', 'Soulful 70s', 'Synthpop', 'Klassisk jazz'. "
+        "Exempel på dåliga svar: 'Stora känslor', 'Episk känsla', 'Tidlös stämning'. "
+        "Bara orden, inget annat."
+    )
+    try:
+        resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        label = resp.text.strip().strip('.')
+        return label if label else None
+    except Exception as e:
+        logging.warning(f"[mix_labels] Gemini-fel: {e}")
+        return None
+
+
+def _refresh_mix_labels():
+    """Genererar AI-labels för Daily Mix 1–6 och cachar i DB. Körs i bakgrund."""
+    now = int(time.time())
+    stale_ids = set()
+
+    with sqlite3.connect(_SEARCH_CACHE_DB) as conn:
+        rows = {r[0]: r[1] for r in conn.execute(
+            "SELECT mix_id, cached_at FROM mix_labels"
+        ).fetchall()}
+    for mix_id in range(6):
+        if mix_id not in rows or (now - rows[mix_id]) > _MIX_LABEL_TTL:
+            stale_ids.add(mix_id)
+
+    if not stale_ids:
+        return
+
+    mixes_raw = _fetch_daily_mixes_raw()
+    for item in mixes_raw:
+        parts = item.get('text', '').split('\n')
+        title = parts[0]
+        if not (title.startswith('Daily Mix ') and len(title) == 11 and '1' <= title[10] <= '6'):
+            continue
+        mix_id = int(title[10]) - 1
+        if mix_id not in stale_ids:
+            continue
+        artists_text = parts[1] if len(parts) > 1 else title
+        label = _get_mix_label(artists_text)
+        if label:
+            with sqlite3.connect(_SEARCH_CACHE_DB) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO mix_labels (mix_id, label, cached_at) VALUES (?,?,?)",
+                    (mix_id, label, int(time.time()))
+                )
+            logging.info(f"[mix_labels] {title} → \"{label}\"")
+
+
+def _mix_label_loop():
+    time.sleep(5)
+    while True:
+        try:
+            _refresh_mix_labels()
+        except Exception as e:
+            logging.warning(f"[mix_labels] refresh-fel: {e}")
+        time.sleep(_MIX_LABEL_TTL)
 
 
 def _search_cache_get(query: str, search_type: str, limit: int):
@@ -730,17 +835,59 @@ def get_daily_mixes():
 
 @app.route('/get_daily_mixes_knob')
 def get_daily_mixes_knob():
-    """Textlista för knappen: title|desc|index, en per rad, bara Daily Mix 1-6."""
+    """Textlista för knappen: title|label|index, en per rad, bara Daily Mix 1-6.
+    label är AI-genererad stämningssummering (1-2 ord); fallback på första artisten."""
+    with sqlite3.connect(_SEARCH_CACHE_DB) as conn:
+        cached_labels = {r[0]: r[1] for r in conn.execute(
+            "SELECT mix_id, label FROM mix_labels"
+        ).fetchall()}
+
     lines = []
     for item in _fetch_daily_mixes_raw():
         parts = item.get('text', '').split('\n')
         title = parts[0]
         if not (title.startswith('Daily Mix ') and len(title) == 11 and '1' <= title[10] <= '6'):
             continue
-        desc = parts[1] if len(parts) > 1 else ''
         idx = int(title[10]) - 1
-        lines.append(f"{title}|{desc}|{idx}")
+        if idx in cached_labels:
+            label = cached_labels[idx]
+        else:
+            # Fallback: första artisten ur beskrivningstexten
+            desc = parts[1] if len(parts) > 1 else ''
+            label = desc.split(',')[0].strip() if desc else title
+        lines.append(f"{title}|{label}|{idx}")
     return '\n'.join(lines), 200, {'Content-Type': 'text/plain; charset=utf-8'}
+
+_BUTTON_PROMPTS_FILE = Path(__file__).parent / "button_prompts.json"
+
+@app.route('/button_prompt')
+def button_prompt():
+    """Mappar en knapptryckning till en Edgar-prompt.
+    ?id=1&room=vardagsrum — fire-and-forget till Edgar /api/chat."""
+    btn_id = request.args.get('id', '').strip()
+    room   = request.args.get('room', '').strip()
+
+    try:
+        prompts = json.loads(_BUTTON_PROMPTS_FILE.read_text())
+    except Exception:
+        return jsonify({"error": "button_prompts.json saknas eller ogiltig"}), 500
+
+    prompt = prompts.get(btn_id)
+    if not prompt:
+        return jsonify({"error": f"Ingen prompt för knapp {btn_id!r}"}), 404
+
+    payload = {
+        "message":      prompt,
+        "client_id":    f"remote_{room or 'default'}",
+        "default_room": room or None,
+    }
+    try:
+        requests.post(f"{EDGAR_URL}/api/chat", json=payload, timeout=60)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+    return jsonify({"status": "ok", "button": btn_id, "room": room, "prompt": prompt})
+
 
 @app.route('/get_radio_favorites')
 def get_radio_favorites():
@@ -1456,4 +1603,5 @@ if __name__ == '__main__':
     print("--- Lyrionbridge v2: https://0.0.0.0:5001 (iPhone PWA)   ---")
 
     threading.Thread(target=http_server.serve_forever, daemon=True).start()
+    threading.Thread(target=_mix_label_loop, daemon=True, name="mix-labels").start()
     https_server.serve_forever()

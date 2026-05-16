@@ -9,7 +9,8 @@ A Python bridge for [Lyrion Music Server](https://lyrion.org) that acts as the m
 | `lms_bridge.py` | Flask app (port 5000/5001) — REST API wrapping LMS JSON-RPC and Spotify via Spotty |
 | `lms_logger.py` | Daemon subscribing to LMS CLI events, logging plays to SQLite, estimating audio features via Gemini |
 | `play_history.db` | SQLite — play log, skip flags, audio features cache, track features cache |
-| `metadata_cache.db` | SQLite — Spotify search result cache (30-day TTL for tracks, 7-day for others) |
+| `metadata_cache.db` | SQLite — Spotify search result cache + AI-generated Daily Mix labels |
+| `button_prompts.json` | Maps button IDs to Edgar prompts for physical remotes |
 
 ## Features
 
@@ -20,15 +21,18 @@ A Python bridge for [Lyrion Music Server](https://lyrion.org) that acts as the m
 - **Play history API** — recent tracks, artists, skipped tracks and listening stats for Edgar
 - **Audio features** — energy/valence/danceability/tempo estimated via Gemini, cached to avoid repeat API calls
 - **Spotify caching** — search results cached on disk (30 days for tracks, 7 days for albums/artists/playlists)
+- **Daily Mix labels** — AI-generated 1–2 word Swedish style labels per Daily Mix (e.g. "EBM-klubb", "80-talssynth"), refreshed every 6 hours
+- **Button prompts** — physical remotes with no screen can trigger Edgar prompts via `/button_prompt`
 - **PWA** — mobile-optimized web app served directly by the bridge
 
 ## Requirements
 
 ```bash
-pip install flask requests python-dotenv
+pip install flask requests google-genai
 ```
 
-`lms_logger.py` additionally requires `google-genai` for audio feature estimation and reads `GEMINI_API_KEY` from `.env` (falls back to `../edgar/.env` if no local `.env` exists).
+`lms_bridge.py` reads `GEMINI_API_KEY` from `../edgar/.env` for Daily Mix label generation.
+`lms_logger.py` uses the same key for audio feature estimation.
 
 ## Setup
 
@@ -75,6 +79,8 @@ Open `http://<server-ip>:5000` in a browser or add it to your home screen as a P
 | `GET /active_players` | List players currently playing |
 | `GET /get_playlists_with_art` | List saved playlists with artwork |
 | `GET /get_daily_mixes` | List Spotify Daily Mixes |
+| `GET /get_daily_mixes_knob` | Daily Mix 1–6 as `title\|AI-label\|index` lines for display devices |
+| `GET /button_prompt?id=N&room=...` | Trigger an Edgar prompt mapped to button N (see `button_prompts.json`) |
 
 ### Search
 
