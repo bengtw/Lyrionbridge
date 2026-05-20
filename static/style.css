@@ -172,7 +172,7 @@ body {
 /* --- BOTTOM MENU --- */
 .bottom-menu {
     display: grid;
-    grid-template-columns: repeat(5, 1fr);
+    grid-template-columns: repeat(4, 1fr);
     gap: 8px;
     background: none;
     padding: 0 0 env(safe-area-inset-bottom);
@@ -639,7 +639,7 @@ body {
     }
 
     .album-grid-container {
-        grid-template-columns: repeat(5, minmax(0, 1fr));
+        grid-template-columns: repeat(4, minmax(0, 1fr));
         gap: 28px 14px;
         padding: 8px 12px 50px;
     }
@@ -696,51 +696,3 @@ body {
     scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
 }
 
-/* --- EDGAR TOAST --- */
-.edgar-toast {
-    position: fixed;
-    bottom: calc(130px + env(safe-area-inset-bottom));
-    left: 20px;
-    right: 20px;
-    background: rgba(25, 25, 30, 0.97);
-    backdrop-filter: blur(30px);
-    -webkit-backdrop-filter: blur(30px);
-    border: 1px solid rgba(255, 149, 0, 0.35);
-    border-radius: 22px;
-    padding: 14px 18px;
-    z-index: 900;
-    box-shadow: 0 0 24px rgba(255, 149, 0, 0.2);
-    transform: translateY(calc(100% + 20px));
-    transition: transform 0.38s cubic-bezier(0.2, 1, 0.3, 1), opacity 0.38s;
-    opacity: 0;
-    pointer-events: none;
-}
-
-.edgar-toast.visible {
-    transform: translateY(0);
-    opacity: 1;
-}
-
-.edgar-toast p {
-    margin: 0;
-    font-size: 14px;
-    line-height: 1.5;
-    color: white;
-}
-
-/* --- EDGAR LYSSNARTILLSTÅND --- */
-#edgar-btn.listening {
-    background: rgba(255, 149, 0, 0.18);
-    border-color: var(--accent);
-    color: var(--accent);
-    animation: edgar-pulse 1.2s ease-in-out infinite;
-}
-
-#edgar-btn.listening svg {
-    stroke: var(--accent);
-}
-
-@keyframes edgar-pulse {
-    0%, 100% { box-shadow: 0 0 12px rgba(255, 149, 0, 0.4); }
-    50%       { box-shadow: 0 0 28px rgba(255, 149, 0, 0.75); }
-}

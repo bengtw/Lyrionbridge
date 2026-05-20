@@ -46,7 +46,9 @@ LMS_URL = f"http://{LMS_HOST}:9000/jsonrpc.js"
 C5_IP   = "10.0.1.125"
 C5_MAC  = "bb:bb:7a:f8:33:39"
 DEBUG              = os.getenv("BRIDGE_DEBUG", "").lower() == "true"
-LASTFM_API_KEY     = os.getenv("LASTFM_API_KEY",  "9ed2b1dfa5c3f0ece0a30ec8e69b4742")
+LASTFM_API_KEY     = os.getenv("LAST_FM_API_KEY") or os.getenv("LASTFM_API_KEY", "9ed2b1dfa5c3f0ece0a30ec8e69b4742")
+LASTFM_API_SECRET  = os.getenv("LAST_FM_API_SECRET") or os.getenv("LASTFM_API_SECRET", "")
+LASTFM_SESSION_KEY = os.getenv("LASTFM_SESSION_KEY", "")
 LASTFM_USERNAME    = os.getenv("LASTFM_USERNAME", "LadoCasseta")
 
 FAVORITE_PLAYLISTS = [
@@ -87,6 +89,7 @@ def _init_search_cache():
 
 _init_search_cache()
 
+_db_lock       = threading.Lock()   # serialiserar skrivningar mot metadata_cache.db
 _gemini_client = None
 _gemini_lock   = threading.Lock()
 
@@ -155,7 +158,7 @@ def _refresh_mix_labels():
         artists_text = parts[1] if len(parts) > 1 else title
         label = _get_mix_label(artists_text)
         if label:
-            with sqlite3.connect(_SEARCH_CACHE_DB) as conn:
+            with _db_lock, sqlite3.connect(_SEARCH_CACHE_DB) as conn:
                 conn.execute(
                     "INSERT OR REPLACE INTO mix_labels (mix_id, label, cached_at) VALUES (?,?,?)",
                     (mix_id, label, int(time.time()))
@@ -185,7 +188,7 @@ def _search_cache_get(query: str, search_type: str, limit: int):
 
 
 def _search_cache_set(query: str, search_type: str, limit: int, results: list):
-    with sqlite3.connect(_SEARCH_CACHE_DB) as conn:
+    with _db_lock, sqlite3.connect(_SEARCH_CACHE_DB) as conn:
         conn.execute(
             "INSERT OR REPLACE INTO search_cache (query, type, limit_n, results, cached_at) VALUES (?,?,?,?,?)",
             (query, search_type, limit, json.dumps(results), int(time.time())),
@@ -425,6 +428,29 @@ _lastfm_taste_cache_time = 0
 _LASTFM_TASTE_TTL        = 900  # 15 minuter
 
 _lastfm_fail_counts: dict[str, int] = {}
+
+def _lastfm_sig(params: dict) -> str:
+    s = "".join(f"{k}{v}" for k, v in sorted(params.items()) if k != "format")
+    return __import__("hashlib").md5((s + LASTFM_API_SECRET).encode()).hexdigest()
+
+def _lastfm_post(method: str, **params) -> dict | None:
+    """Autentiserat POST-anrop mot Last.fm API (kräver session key)."""
+    if not (LASTFM_API_KEY and LASTFM_API_SECRET and LASTFM_SESSION_KEY):
+        return None
+    p = {"method": method, "api_key": LASTFM_API_KEY, "sk": LASTFM_SESSION_KEY, **params}
+    p["api_sig"] = _lastfm_sig(p)
+    p["format"]  = "json"
+    try:
+        r = _session.post("https://ws.audioscrobbler.com/2.0/", data=p, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        if "error" in data:
+            print(f"[LastFM] {method} fel {data['error']}: {data.get('message', '')}")
+            return None
+        return data
+    except Exception as e:
+        print(f"[LastFM] {method} misslyckades: {e}")
+        return None
 
 def _lastfm_get(method, **params):
     """Läs-anrop mot Last.fm API (ingen signatur krävs)."""
@@ -1256,34 +1282,6 @@ def recent_artists():
                     break
     return jsonify({"artists": artists})
 
-@app.route('/edgar_chat', methods=['POST'])
-def edgar_chat():
-    data = request.json or {}
-    message = data.get('message', '').strip()
-    if not message:
-        return jsonify({"error": "Inget meddelande"}), 400
-    _, room_name = get_player_info(data.get('room', ''))
-
-    taste = _get_lastfm_taste_profile()
-    user_context = ""
-    if taste and (taste["top_artists"] or taste["recent_tracks"]):
-        parts = []
-        if taste["top_artists"]:
-            parts.append("Favoritartister senaste månaden: " + ", ".join(taste["top_artists"]))
-        if taste["recent_tracks"]:
-            parts.append("Nyligen spelade låtar: " + "; ".join(taste["recent_tracks"]))
-        user_context = " | ".join(parts)
-
-    try:
-        resp = _session.post(f"{EDGAR_URL}/chat", json={
-            "message":      message,
-            "client_id":    "multilyrion",
-            "default_room": room_name,
-            "user_context": user_context,
-        }, timeout=180)
-        return jsonify(resp.json())
-    except Exception as e:
-        return jsonify({"error": str(e)}), 502
 
 @app.route('/lastfm_tag_artists')
 def lastfm_tag_artists():
@@ -1586,6 +1584,116 @@ def play_history_data_endpoint():
             bucket = min(int(r["energy"] * 10), 9)
             energy_dist[bucket] += 1
     return jsonify(plays=plays, profile=profile, top_artists=top_artists, energy_dist=energy_dist)
+
+
+@app.route('/like_track')
+def like_track():
+    """Gillar nuvarande låt: lovar på Last.fm + flaggar loved=1 i plays-tabellen."""
+    room = request.args.get("room")
+
+    # Hämta spelande spelare om inget rum angavs
+    if not room:
+        for p in get_all_players():
+            mac = p.get("playerid")
+            if not mac:
+                continue
+            res = lms_json_rpc(mac, ["status", "-", "1"])
+            if res and res.get("result", {}).get("mode") == "play":
+                room = mac
+                break
+        if not room:
+            return jsonify({"error": "Ingen spelare spelar just nu"}), 404
+
+    # Hämta nuvarande låt
+    try:
+        res    = lms_json_rpc(room, ["status", "-", "1", "tags:al"])
+        result = (res or {}).get("result", {})
+        track  = (result.get("playlist_loop") or [{}])[0]
+        artist = track.get("artist", "").strip()
+        title  = track.get("title",  "").strip()
+    except Exception as e:
+        return jsonify({"error": f"Kunde inte hämta låtinfo: {e}"}), 500
+
+    if not artist or not title:
+        return jsonify({"error": "Ingen låt spelar"}), 404
+
+    # Last.fm love
+    lfm_ok = False
+    if LASTFM_SESSION_KEY:
+        result = _lastfm_post("track.love", artist=artist, track=title)
+        lfm_ok = result is not None
+        print(f"[LastFM] {'♥ loved' if lfm_ok else '✗ love misslyckades'}: {artist} – {title}")
+    else:
+        print(f"[LastFM] Ingen session key — hoppar över Last.fm love")
+
+    # Flagga loved=1 i plays-tabellen
+    db_path = Path(__file__).parent / "play_history.db"
+    db_ok = False
+    try:
+        with sqlite3.connect(db_path) as conn:
+            # Migrera kolumn om den saknas
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(plays)").fetchall()]
+            if "loved" not in cols:
+                conn.execute("ALTER TABLE plays ADD COLUMN loved INTEGER DEFAULT 0")
+            # Markera de senaste matchande raderna (samma artist+title, ej redan gillad)
+            conn.execute(
+                "UPDATE plays SET loved=1 WHERE lower(artist)=lower(?) AND lower(title)=lower(?) AND loved=0",
+                (artist, title),
+            )
+            db_ok = True
+    except Exception as e:
+        print(f"[Like] DB-fel: {e}")
+
+    return jsonify({"artist": artist, "title": title, "lastfm": lfm_ok, "db": db_ok})
+
+
+@app.route('/skip_track')
+def skip_track():
+    """Flaggar nuvarande låt som skippat i plays-tabellen och hoppar till nästa."""
+    room = request.args.get("room")
+
+    if not room:
+        for p in get_all_players():
+            mac = p.get("playerid")
+            if not mac:
+                continue
+            res = lms_json_rpc(mac, ["status", "-", "1"])
+            if res and res.get("result", {}).get("mode") == "play":
+                room = mac
+                break
+        if not room:
+            return jsonify({"error": "Ingen spelare spelar just nu"}), 404
+
+    # Hämta nuvarande låt innan vi hoppar
+    try:
+        res    = lms_json_rpc(room, ["status", "-", "1", "tags:al"])
+        result = (res or {}).get("result", {})
+        track  = (result.get("playlist_loop") or [{}])[0]
+        artist = track.get("artist", "").strip()
+        title  = track.get("title",  "").strip()
+    except Exception as e:
+        return jsonify({"error": f"Kunde inte hämta låtinfo: {e}"}), 500
+
+    # Hoppa till nästa
+    lms_json_rpc(room, ["playlist", "index", "+1"])
+
+    # Flagga skipped i plays-tabellen
+    db_ok = False
+    if artist and title:
+        db_path = Path(__file__).parent / "play_history.db"
+        try:
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "UPDATE plays SET skipped=1 WHERE lower(artist)=lower(?) AND lower(title)=lower(?) "
+                    "AND id=(SELECT id FROM plays WHERE lower(artist)=lower(?) AND lower(title)=lower(?) ORDER BY ts DESC LIMIT 1)",
+                    (artist, title, artist, title),
+                )
+            db_ok = True
+            print(f"[Skip] ✗ {artist} – {title}")
+        except Exception as e:
+            print(f"[Skip] DB-fel: {e}")
+
+    return jsonify({"artist": artist, "title": title, "db": db_ok})
 
 
 if __name__ == '__main__':
