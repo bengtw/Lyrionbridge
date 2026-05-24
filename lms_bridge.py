@@ -1293,6 +1293,9 @@ def lastfm_tag_artists():
         limit = min(int(request.args.get('limit', '10')), 30)
     except ValueError:
         limit = 10
+    cached = _search_cache_get(tag, "lastfm_tag_artists", limit)
+    if cached is not None:
+        return jsonify({"tag": tag, "artists": cached, "cached": True})
     resp = _lastfm_get("tag.getTopArtists", tag=tag, limit=limit)
     if not resp or "topartists" not in resp:
         return jsonify({"tag": tag, "artists": []})
@@ -1300,6 +1303,7 @@ def lastfm_tag_artists():
         {"name": a.get("name", ""), "rank": int(a.get("@attr", {}).get("rank", 0))}
         for a in resp["topartists"].get("artist", [])
     ]
+    _search_cache_set(tag, "lastfm_tag_artists", limit, artists)
     return jsonify({"tag": tag, "artists": artists})
 
 @app.route('/lastfm_tag_tracks')
