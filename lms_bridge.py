@@ -1312,6 +1312,9 @@ def lastfm_tag_tracks():
         limit = min(int(request.args.get('limit', '15')), 30)
     except ValueError:
         limit = 15
+    cached = _search_cache_get(tag, "lastfm_tag_tracks", limit)
+    if cached is not None:
+        return jsonify({"tag": tag, "tracks": cached, "cached": True})
     resp = _lastfm_get("tag.getTopTracks", tag=tag, limit=limit)
     if not resp or "tracks" not in resp:
         return jsonify({"tag": tag, "tracks": []})
@@ -1320,6 +1323,7 @@ def lastfm_tag_tracks():
         for t in resp["tracks"].get("track", [])
         if t.get("artist", {}).get("name") and t.get("name")
     ]
+    _search_cache_set(tag, "lastfm_tag_tracks", limit, tracks)
     return jsonify({"tag": tag, "tracks": tracks})
 
 @app.route('/lastfm_similar')
@@ -1645,6 +1649,16 @@ def like_track():
         print(f"[Like] DB-fel: {e}")
 
     return jsonify({"artist": artist, "title": title, "lastfm": lfm_ok, "db": db_ok})
+
+
+@app.route('/deck_play_pause')
+def deck_play_pause():
+    """Skickar play/pause-toggle till kontoret."""
+    mac, name = get_player_info("kontoret")
+    if not mac:
+        return jsonify({"error": f"Hittade inte kontoret"}), 404
+    lms_json_rpc(mac, ["pause"])
+    return jsonify({"action": "toggle", "player": name})
 
 
 @app.route('/skip_track')
