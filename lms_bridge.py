@@ -323,6 +323,14 @@ def _any_player_mac():
     players = get_all_players()
     return players[0].get('playerid', '') if players else ""
 
+def _strip_definite(s: str) -> str:
+    """Tar bort svenska bestämd-form-ändelser: vardagsrummet → vardagsrum."""
+    for suf in ("mmet", "mmen", "met", "men", "et", "en", "t", "n"):
+        if s.endswith(suf) and len(s) - len(suf) >= 3:
+            return s[:-len(suf)]
+    return s
+
+
 def get_player_info(room_arg):
     """Matcher dynamiskt rummet mot aktiva spelare i LMS."""
     players = get_all_players()
@@ -340,9 +348,15 @@ def get_player_info(room_arg):
                 return decoded, p.get('name')
         return decoded, "unknown"
 
+    hints = {decoded, _strip_definite(decoded)}
     for p in players:
         name = p.get('name', '').lower()
-        if decoded in name or name in decoded:
+        pid  = p.get('playerid', '').lower()
+        if decoded == name or decoded == pid:
+            return p.get('playerid'), p.get('name')
+    for p in players:
+        name = p.get('name', '').lower()
+        if any(h in name or name in h for h in hints):
             return p.get('playerid'), p.get('name')
 
     return None, decoded
@@ -445,11 +459,11 @@ def _lastfm_post(method: str, **params) -> dict | None:
         r.raise_for_status()
         data = r.json()
         if "error" in data:
-            print(f"[LastFM] {method} fel {data['error']}: {data.get('message', '')}")
+            logging.warning("[LastFM] %s fel %s: %s", method, data['error'], data.get('message', ''))
             return None
         return data
     except Exception as e:
-        print(f"[LastFM] {method} misslyckades: {e}")
+        logging.warning("[LastFM] %s misslyckades: %s", method, e)
         return None
 
 def _lastfm_get(method, **params):
@@ -467,12 +481,12 @@ def _lastfm_get(method, **params):
         data = r.json()
         if "error" in data:
             _lastfm_fail_counts[method] = _lastfm_fail_counts.get(method, 0) + 1
-            print(f"[LastFM] {method} API-fel {data['error']}: {data.get('message', '')} (totalt {_lastfm_fail_counts[method]}x)")
+            logging.warning("[LastFM] %s API-fel %s: %s (totalt %dx)", method, data['error'], data.get('message', ''), _lastfm_fail_counts[method])
             return None
         return data
     except Exception as e:
         _lastfm_fail_counts[method] = _lastfm_fail_counts.get(method, 0) + 1
-        print(f"[LastFM] {method} misslyckades: {e} (totalt {_lastfm_fail_counts[method]}x)")
+        logging.warning("[LastFM] %s misslyckades: %s (totalt %dx)", method, e, _lastfm_fail_counts[method])
         return None
 
 def _get_lastfm_taste_profile():
@@ -1113,6 +1127,19 @@ def active_players():
     return jsonify(playing)
 
 
+@app.route('/resolve_player')
+def resolve_player_endpoint():
+    """Löser upp ett rumsnamn eller MAC-adress till spelaren's playerid och namn.
+    ?name=vardagsrum → {"playerid": "aa:bb:...", "name": "Vardagsrum"}
+    Utan ?name returneras första spelaren (fallback — aktiv-spelare-logik sitter i edgar).
+    """
+    name = request.args.get('name', '').strip() or None
+    mac, player_name = get_player_info(name)
+    if mac:
+        return jsonify({"playerid": mac, "name": player_name})
+    return jsonify({"error": f"Hittade inte spelaren '{name}'"})
+
+
 @app.route('/stop_active')
 def stop_active():
     """Stoppar alla spelare som för närvarande spelar."""
@@ -1259,30 +1286,6 @@ def library_by_genre():
     return jsonify({"genre_id": genre_id, "tracks": tracks})
 
 
-@app.route('/recent_artists')
-def recent_artists():
-    """Artister från de senast spelade låtarna i LMS, unika i spelordning."""
-    try:
-        limit = int(request.args.get('limit', '50'))
-    except ValueError:
-        limit = 50
-    limit = max(1, min(limit, 200))
-
-    # Hämta fler spår än vi behöver för att få tillräckligt med unika artister
-    res = lms_json_rpc(None, ["tracks", 0, limit * 4, "tags:a", "sort:lastplayed"])
-    artists = []
-    seen = set()
-    if res and 'result' in res:
-        for track in res['result'].get('titles_loop', []):
-            artist = track.get('artist', '').strip()
-            if artist and artist.lower() not in seen:
-                seen.add(artist.lower())
-                artists.append(artist)
-                if len(artists) >= limit:
-                    break
-    return jsonify({"artists": artists})
-
-
 @app.route('/lastfm_tag_artists')
 def lastfm_tag_artists():
     """Toppkonstnärer för en Last.fm-tagg (genre/stämning)."""
@@ -1354,7 +1357,7 @@ def lastfm_recommendations():
     """Liknande artister baserat på användarens top-artister den senaste månaden."""
     taste = _get_lastfm_taste_profile()
     if not taste or not taste["top_artists"]:
-        print(f"[LastFM] lastfm_recommendations: ingen smakprofil tillgänglig — returnerar tom data")
+        logging.info("[LastFM] lastfm_recommendations: ingen smakprofil tillgänglig — returnerar tom data")
         return jsonify({"based_on": [], "similar": []}), 200
 
     try:
@@ -1594,6 +1597,56 @@ def play_history_data_endpoint():
     return jsonify(plays=plays, profile=profile, top_artists=top_artists, energy_dist=energy_dist)
 
 
+@app.route('/resolved_uris')
+def resolved_uris():
+    """Returnerar alla Spotify-URIs som lms_logger har upplöst för (artist, title)-par.
+    Används av edgar för att förvärma sin in-memory track_cache vid start."""
+    db_path = Path(__file__).parent / "play_history.db"
+    if not db_path.exists():
+        return jsonify([])
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute("""
+                SELECT DISTINCT lower(artist) AS artist, lower(title) AS title, spotify_uri
+                FROM plays
+                WHERE spotify_uri IS NOT NULL AND spotify_uri != ''
+                  AND artist IS NOT NULL AND title IS NOT NULL
+            """).fetchall()
+        return jsonify([{"artist": a, "title": t, "uri": u} for a, t, u in rows])
+    except Exception as e:
+        logging.warning("[resolved_uris] DB-fel: %s", e)
+        return jsonify([])
+
+
+@app.route('/mark_origin', methods=['POST'])
+def mark_origin():
+    """Skriver köade spår till pending_origins-tabellen så lms_logger kan märka
+    framtida plays med ursprung (t.ex. 'nydj'). Skickas från edgar när låtar köas."""
+    data = request.get_json(force=True, silent=True) or {}
+    origin = (data.get("origin") or "").strip()
+    tracks = data.get("tracks") or []
+    if not origin or not tracks:
+        return jsonify({"error": "origin och tracks krävs"}), 400
+    rows = [
+        (t["artist"].lower(), t["title"].lower(), origin, int(time.time()))
+        for t in tracks
+        if t.get("artist") and t.get("title")
+    ]
+    if not rows:
+        return jsonify({"written": 0})
+    db_path = Path(__file__).parent / "play_history.db"
+    try:
+        with sqlite3.connect(db_path) as conn:
+            conn.executemany(
+                "INSERT INTO pending_origins (artist_lower, title_lower, origin, ts) VALUES (?,?,?,?)",
+                rows,
+            )
+        return jsonify({"written": len(rows)})
+    except Exception as e:
+        logging.warning("[mark_origin] DB-fel: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/like_track')
 def like_track():
     """Gillar nuvarande låt: lovar på Last.fm + flaggar loved=1 i plays-tabellen."""
@@ -1630,9 +1683,12 @@ def like_track():
     if LASTFM_SESSION_KEY:
         result = _lastfm_post("track.love", artist=artist, track=title)
         lfm_ok = result is not None
-        print(f"[LastFM] {'♥ loved' if lfm_ok else '✗ love misslyckades'}: {artist} – {title}")
+        if lfm_ok:
+            logging.info("[LastFM] ♥ loved: %s – %s", artist, title)
+        else:
+            logging.warning("[LastFM] love misslyckades: %s – %s", artist, title)
     else:
-        print(f"[LastFM] Ingen session key — hoppar över Last.fm love")
+        logging.warning("[LastFM] Ingen session key — hoppar över Last.fm love")
 
     # Flagga loved=1 i plays-tabellen
     db_path = Path(__file__).parent / "play_history.db"
