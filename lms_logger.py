@@ -70,6 +70,18 @@ def init_db():
                          ("danceability","REAL"), ("tempo","REAL")]:
             if col not in cols:
                 conn.execute(f"ALTER TABLE plays ADD COLUMN {col} {typ}")
+        # Migrera: lägg till origin-kolumn om den saknas
+        if "origin" not in cols:
+            conn.execute("ALTER TABLE plays ADD COLUMN origin TEXT")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pending_origins (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                artist_lower TEXT NOT NULL,
+                title_lower  TEXT NOT NULL,
+                origin       TEXT NOT NULL,
+                ts           INTEGER NOT NULL
+            )
+        """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS track_features_cache (
                 artist       TEXT    NOT NULL,
@@ -155,6 +167,18 @@ def _on_stop(mac):
         _state.pop(mac, None)
 
 
+def _notify_alma(artist: str, title: str, source: str):
+    """Informerar Alma om en ny artist — fire-and-forget."""
+    try:
+        requests.post(
+            "http://alma.local:5002/add_artist",
+            json={"artist": artist, "title": title, "source": source},
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
 def _on_newsong(mac):
     now        = int(time.time())
     track      = _get_track(mac)
@@ -173,24 +197,42 @@ def _on_newsong(mac):
         if not track:
             return
 
+        # Kolla om ursprung är känt via pending_origins
+        origin = None
+        if track["artist"] and track["title"]:
+            row = conn.execute("""
+                SELECT origin FROM pending_origins
+                WHERE artist_lower=? AND title_lower=? AND ts > ?
+                ORDER BY ts DESC LIMIT 1
+            """, (track["artist"].lower(), track["title"].lower(), now - 7200)).fetchone()
+            if row:
+                origin = row["origin"]
+                conn.execute("DELETE FROM pending_origins WHERE ts < ?", (now - 7200,))
+
         cur    = conn.execute(
-            "INSERT INTO plays (ts, player, artist, title, album, duration, source, spotify_uri) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO plays (ts, player, artist, title, album, duration, source, spotify_uri, origin) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             (now, player, track["artist"], track["title"],
-             track["album"], track["duration"], track["source"], track["spotify_uri"]),
+             track["album"], track["duration"], track["source"], track["spotify_uri"], origin),
         )
         row_id = cur.lastrowid
 
     with _state_lock:
         _state[mac] = {"ts_start": now, "row_id": row_id, "duration": track["duration"]}
 
-    src_tag = "spotify" if track["source"] == "spotify" else "local "
-    print(f"[LOG] [{src_tag}] {player}: {track['artist']} — {track['title']}")
+    src_tag    = "spotify" if track["source"] == "spotify" else "local "
+    origin_tag = f" [{origin}]" if origin else ""
+    print(f"[LOG] [{src_tag}]{origin_tag} {player}: {track['artist']} — {track['title']}")
 
     if track["artist"] and track["title"]:
         threading.Thread(
             target=_estimate_and_store,
-            args=(row_id, track["artist"], track["title"]),
+            args=(row_id, track["artist"], track["title"], track.get("spotify_uri")),
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=_notify_alma,
+            args=(track["artist"], track["title"], track["source"]),
             daemon=True,
         ).start()
 
@@ -257,6 +299,37 @@ def _estimate_features_batch(tracks: list[tuple[str, str]]) -> dict:
         return {}
 
 
+_SPOTIFY_FEATURES_DB = os.path.join(os.path.dirname(__file__), "spotify_features.db")
+_spotify_feat_conn = None
+_spotify_feat_lock = threading.Lock()
+
+
+def _lookup_spotify_dataset(spotify_id: str) -> dict | None:
+    """Slår upp audio features i det lokala Kaggle-datasetet via Spotify track ID."""
+    global _spotify_feat_conn
+    if not os.path.exists(_SPOTIFY_FEATURES_DB):
+        return None
+    try:
+        with _spotify_feat_lock:
+            if _spotify_feat_conn is None:
+                _spotify_feat_conn = sqlite3.connect(_SPOTIFY_FEATURES_DB, check_same_thread=False)
+                _spotify_feat_conn.row_factory = sqlite3.Row
+            row = _spotify_feat_conn.execute(
+                "SELECT energy, valence, danceability, tempo FROM spotify_features WHERE spotify_id=?",
+                (spotify_id,),
+            ).fetchone()
+        if row and row["energy"] is not None:
+            return {
+                "energy":       row["energy"],
+                "valence":      row["valence"],
+                "danceability": row["danceability"],
+                "tempo":        row["tempo"],
+            }
+    except Exception as e:
+        print(f"[Features] Dataset-fel: {e}")
+    return None
+
+
 def _lookup_features_cache(artist: str, title: str) -> dict | None:
     with _db() as conn:
         row = conn.execute(
@@ -278,12 +351,28 @@ def _store_features_cache(artist: str, title: str, f: dict):
         )
 
 
-def _estimate_and_store(row_id: int, artist: str, title: str):
+def _estimate_and_store(row_id: int, artist: str, title: str, spotify_uri: str | None = None):
     """Estimerar features för ett enskilt spår och sparar i DB. Körs i bakgrundstråd."""
+    # 1. Lokalt Kaggle-dataset (exakt match via Spotify ID)
+    if spotify_uri:
+        sid = spotify_uri.split(":")[-1]
+        f = _lookup_spotify_dataset(sid)
+        if f:
+            print(f"[Features] {artist} — {title}: dataset-träff")
+            with _db() as conn:
+                conn.execute(
+                    "UPDATE plays SET energy=?, valence=?, danceability=?, tempo=? WHERE id=?",
+                    (f["energy"], f["valence"], f["danceability"], f["tempo"], row_id),
+                )
+            _store_features_cache(artist, title, f)
+            return
+
+    # 2. Lokal cache (artist+titel)
     f = _lookup_features_cache(artist, title)
     if f:
         print(f"[Features] {artist} — {title}: cache-träff")
     else:
+        # 3. Gemini-estimering
         features = _estimate_features_batch([(artist, title)])
         f = features.get((artist, title))
         if not f:
@@ -301,29 +390,40 @@ def backfill_features(batch_size: int = 30):
     """Fyller på audio features för alla spår i DB som saknar dem. Körs manuellt."""
     with _db() as conn:
         rows = conn.execute(
-            "SELECT id, artist, title FROM plays WHERE energy IS NULL AND artist != '' AND title != ''",
+            "SELECT id, artist, title, spotify_uri FROM plays WHERE energy IS NULL AND artist != '' AND title != ''",
         ).fetchall()
 
     if not rows:
         print("[Features] Alla spår har redan features.")
         return
 
-    print(f"[Features] Backfill: {len(rows)} spår saknar features — söker i cache först...")
+    print(f"[Features] Backfill: {len(rows)} spår saknar features — dataset + cache...")
+    dataset_hits = 0
     cache_hits = 0
     needs_estimation = []
     with _db() as conn:
         for row in rows:
-            f = _lookup_features_cache(row["artist"], row["title"])
+            # 1. Kaggle-dataset via Spotify ID
+            f = None
+            if row["spotify_uri"]:
+                sid = row["spotify_uri"].split(":")[-1]
+                f = _lookup_spotify_dataset(sid)
+                if f:
+                    dataset_hits += 1
+            # 2. Lokal artist+titel-cache
+            if not f:
+                f = _lookup_features_cache(row["artist"], row["title"])
+                if f:
+                    cache_hits += 1
             if f:
                 conn.execute(
                     "UPDATE plays SET energy=?, valence=?, danceability=?, tempo=? WHERE id=?",
                     (f["energy"], f["valence"], f["danceability"], f["tempo"], row["id"]),
                 )
-                cache_hits += 1
             else:
                 needs_estimation.append(row)
 
-    print(f"[Features] {cache_hits} från cache, {len(needs_estimation)} behöver estimering via Gemini")
+    print(f"[Features] {dataset_hits} dataset, {cache_hits} cache, {len(needs_estimation)} behöver Gemini")
     if not needs_estimation:
         print("[Features] Backfill klar.")
         return
@@ -390,16 +490,20 @@ def recent_tracks(limit=100, days=14):
 
 
 def skipped_tracks(limit=50, days=14):
-    """Returnerar spår som ofta skippas — negativ signal."""
+    """Returnerar spår med positivt netto-skip-saldo.
+    Varje komplett spelning (-1) kvittar mot ett skip (+1),
+    så låtar med många fullständiga spelningar har ett tillgodohavande."""
     since = int(time.time()) - days * 86400
     with _db() as conn:
         rows = conn.execute(
             """
-            SELECT artist, title, COUNT(*) AS skips
+            SELECT artist, title,
+                   SUM(CASE WHEN skipped=1 THEN 1 ELSE -1 END) AS net_skips
             FROM plays
-            WHERE ts >= ? AND skipped = 1
-            GROUP BY artist, title
-            ORDER BY skips DESC
+            WHERE ts >= ? AND artist != '' AND title != ''
+            GROUP BY LOWER(artist), LOWER(title)
+            HAVING net_skips > 0
+            ORDER BY net_skips DESC
             LIMIT ?
             """,
             (since, limit),
