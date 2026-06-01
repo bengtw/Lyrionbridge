@@ -873,6 +873,78 @@ def get_daily_mixes():
         })
     return jsonify(mixes)
 
+
+_ERA_RE   = __import__('re').compile(r"^\d{2,4}s$", __import__('re').I)
+_GENRE_STEMS = {
+    "pop", "rock", "jazz", "soul", "hip hop", "hip-hop", "electronic", "dance",
+    "house", "techno", "metal", "punk", "folk", "country", "indie", "alternative",
+    "grunge", "synthpop", "new wave", "workout", "mellow", "nu metal", "screamo",
+    "classic rock", "art pop", "soft pop", "indie pop", "alternative rock",
+    "180 bpm", "workout pop", "mellow rock", "focus techno", "walking workout",
+    "chill upbeat", "chill", "happy", "upbeat", "sad", "focus", "party", "r&b",
+}
+
+def _classify_mix(title: str) -> str:
+    t = title.strip()
+    tl = t.lower()
+    if tl.startswith("daily mix"):
+        return "daily_mix"
+    if "radar" in tl:
+        return "radar"
+    if "daylist" in tl:
+        return "daylist"
+    stem = tl.removesuffix(" mix").strip()
+    if _ERA_RE.match(stem):
+        return "era_mix"
+    if stem in _GENRE_STEMS or any(g in stem for g in _GENRE_STEMS):
+        return "genre_mix"
+    return "artist_mix"
+
+
+def _pivot_artist(title: str) -> str | None:
+    """Extraherar artistnamn ur 'Artist Mix'-titel."""
+    if _classify_mix(title) != "artist_mix":
+        return None
+    return title.removesuffix(" Mix").strip()
+
+
+@app.route('/get_all_mixes')
+def get_all_mixes():
+    """Alla Spotty-spellistor med full item_id och typ-klassificering."""
+    mixes = []
+    for item in _fetch_daily_mixes_raw():
+        parts = item.get('text', '').split('\n')
+        title = parts[0]
+        if not any(x in title for x in ["Mix", "Radar", "daylist"]):
+            continue
+        raw_id = item.get('params', {}).get('item_id') or item.get('id', '0.0')
+        mixes.append({
+            'item_id':      raw_id,
+            'id':           raw_id.split('.')[-1],
+            'title':        title,
+            'description':  parts[1] if len(parts) > 1 else "",
+            'art':          _abs_image(item.get('icon') or item.get('image', '')),
+            'mix_type':     _classify_mix(title),
+            'pivot_artist': _pivot_artist(title),
+        })
+    return jsonify(mixes)
+
+
+@app.route('/get_playlist_tracks')
+def get_playlist_tracks():
+    """Hämtar spår ur en Spotty-spellista via item_id."""
+    item_id = request.args.get('item_id', '').strip()
+    limit   = min(int(request.args.get('limit', 30)), 50)
+    if not item_id:
+        return jsonify([])
+    player_mac = _any_player_mac()
+    res = lms_json_rpc(player_mac, ["spotty", "items", 0, limit, f"item_id:{item_id}"], timeout=35)
+    if not res or 'result' not in res:
+        return jsonify([])
+    items = res['result'].get('loop_loop', [])
+    return jsonify([_format_track(it) for it in items if it.get('isaudio') == 1])
+
+
 @app.route('/get_daily_mixes_knob')
 def get_daily_mixes_knob():
     """Textlista för knappen: title|label|index, en per rad, bara Daily Mix 1-6.
@@ -1284,6 +1356,28 @@ def library_by_genre():
             })
     tracks = random.sample(all_tracks, min(limit, len(all_tracks)))
     return jsonify({"genre_id": genre_id, "tracks": tracks})
+
+
+@app.route('/lastfm_artist_tags')
+def lastfm_artist_tags():
+    """Toptaggar för en artist via Last.fm artist.getTopTags."""
+    artist = request.args.get('artist', '').strip()
+    if not artist:
+        return jsonify({"error": "artist saknas"}), 400
+    limit = min(int(request.args.get('limit', '5')), 10)
+    cached = _search_cache_get(artist, "lastfm_artist_tags", limit)
+    if cached is not None:
+        return jsonify({"artist": artist, "tags": cached, "cached": True})
+    resp = _lastfm_get("artist.getTopTags", artist=artist, autocorrect=1)
+    if not resp or "toptags" not in resp:
+        return jsonify({"artist": artist, "tags": []})
+    tags = [
+        {"tag": t.get("name", "").lower(), "count": int(t.get("count", 0))}
+        for t in resp["toptags"].get("tag", [])[:limit]
+        if t.get("name") and int(t.get("count", 0)) > 5
+    ]
+    _search_cache_set(artist, "lastfm_artist_tags", limit, tags)
+    return jsonify({"artist": artist, "tags": tags})
 
 
 @app.route('/lastfm_tag_artists')
@@ -1768,6 +1862,58 @@ def skip_track():
             print(f"[Skip] DB-fel: {e}")
 
     return jsonify({"artist": artist, "title": title, "db": db_ok})
+
+
+@app.route('/queue-tracks', methods=['POST'])
+def queue_tracks():
+    """Köar lösta spår till en spelare. Hanterar Spotty-throttle internt.
+
+    Body: {
+      "room":   "spelarnamn eller MAC",
+      "tracks": [{"source": "spotify|lms", "id": "...", "artist": "...", "title": "..."}],
+      "mode":   "load|add"   // load = power+clear+spela första, add = lägg till i kö
+    }
+    """
+    data   = request.get_json(silent=True) or {}
+    room   = data.get("room")
+    tracks = data.get("tracks", [])
+    mode   = data.get("mode", "add")
+
+    if not tracks:
+        return jsonify({"error": "Inga spår"}), 400
+
+    mac, _ = get_player_info(room)
+    if not mac:
+        return jsonify({"error": f"Spelare hittades inte: {room}"}), 404
+
+    if mode == "load":
+        lms_json_rpc(mac, ["power", "1"])
+        lms_json_rpc(mac, ["playlist", "shuffle", "0"])
+        lms_json_rpc(mac, ["playlist", "clear"])
+
+    queued = []
+    for i, track in enumerate(tracks):
+        source   = track.get("source", "lms")
+        track_id = track.get("id", "")
+        first    = (mode == "load" and i == 0)
+        try:
+            if source == "spotify":
+                action = "play" if first else "add"
+                cmd = (["playlist", action, track_id] if track_id.startswith("spotify://")
+                       else ["spotty", "playlist", action, f"item_id:{track_id}"])
+                lms_json_rpc(mac, cmd, timeout=8)
+                if not first:
+                    time.sleep(0.3)   # Spotty-throttle: max ~3 URI:er/sekund
+            else:
+                cmd_type = "load" if first else "add"
+                lms_json_rpc(mac, ["playlistcontrol", f"cmd:{cmd_type}", f"track_id:{track_id}"])
+            queued.append({"artist": track.get("artist", ""), "title": track.get("title", "")})
+            print(f"[QueueTracks] {'PLAY' if first else 'KÖ  '} {source:7s} "
+                  f"{track.get('artist','?')} – {track.get('title','?')}")
+        except Exception as e:
+            print(f"[QueueTracks] Fel: {track.get('artist')} – {track.get('title')}: {e}")
+
+    return jsonify({"queued": len(queued), "tracks": queued})
 
 
 if __name__ == '__main__':
