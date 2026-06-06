@@ -29,9 +29,10 @@ if not _env.exists():
     _env = Path(__file__).parent.parent / "edgar" / ".env"
 load_dotenv(_env)
 
-LMS_HOST     = "10.0.1.132"
-LMS_CLI_PORT = 9090
-LMS_JSON_URL = f"http://{LMS_HOST}:9000/jsonrpc.js"
+LMS_HOST     = os.getenv("LMS_HOST", "10.0.1.132")
+LMS_CLI_PORT = int(os.getenv("LMS_CLI_PORT", "9090"))
+LMS_PORT     = int(os.getenv("LMS_PORT", "9000"))
+LMS_JSON_URL = f"http://{LMS_HOST}:{LMS_PORT}/jsonrpc.js"
 DB_PATH      = Path(__file__).parent / "play_history.db"
 
 SKIP_THRESHOLD = 0.40  # Andel av spåret som måste spelas för att inte räknas som skip

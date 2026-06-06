@@ -36,10 +36,21 @@ pip install flask requests google-genai
 
 ## Setup
 
-Update the configuration at the top of `lms_bridge.py`:
+Configuration is read from environment variables (or `../edgar/.env`), with
+sensible defaults at the top of `lms_bridge.py`. Override as needed:
 
-```python
-LMS_HOST = "192.168.x.x"
+```env
+LMS_HOST=192.168.x.x      # Lyrion Music Server
+LMS_PORT=9000             # JSON-RPC / web port
+LMS_CLI_PORT=9090         # CLI event port (lms_logger)
+EDGAR_URL=http://127.0.0.1:5015
+C5_IP=10.0.1.125          # Audio Pro C5 (UPnP)
+C5_MAC=bb:bb:7a:f8:33:39
+LMS_PLAYLIST_DIR=/var/lib/squeezeboxserver/playlists
+BRIDGE_PORT=5000          # HTTP
+BRIDGE_HTTPS_PORT=5001    # HTTPS
+BRIDGE_CERT=...           # TLS-cert (default: certs/<ip>+2.pem)
+BRIDGE_KEY=...
 ```
 
 Start the bridge:

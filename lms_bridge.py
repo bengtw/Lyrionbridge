@@ -40,11 +40,15 @@ CATEGORY_INDEX = {
 app = Flask(__name__)
 
 # --- KONFIGURATION ---
-LMS_HOST = "10.0.1.132"
-EDGAR_URL = "http://127.0.0.1:5015"
-LMS_URL = f"http://{LMS_HOST}:9000/jsonrpc.js"
-C5_IP   = "10.0.1.125"
-C5_MAC  = "bb:bb:7a:f8:33:39"
+# Alla adresser/sökvägar går att override:a via .env (../edgar/.env läses ovan).
+LMS_HOST     = os.getenv("LMS_HOST", "10.0.1.132")
+LMS_PORT     = int(os.getenv("LMS_PORT", "9000"))
+LMS_HTTP     = f"http://{LMS_HOST}:{LMS_PORT}"
+LMS_URL      = f"{LMS_HTTP}/jsonrpc.js"
+EDGAR_URL    = os.getenv("EDGAR_URL", "http://127.0.0.1:5015")
+C5_IP        = os.getenv("C5_IP",  "10.0.1.125")
+C5_MAC       = os.getenv("C5_MAC", "bb:bb:7a:f8:33:39")
+PLAYLIST_DIR = os.getenv("LMS_PLAYLIST_DIR", "/var/lib/squeezeboxserver/playlists")
 DEBUG              = os.getenv("BRIDGE_DEBUG", "").lower() == "true"
 LASTFM_API_KEY     = os.getenv("LAST_FM_API_KEY") or os.getenv("LASTFM_API_KEY", "9ed2b1dfa5c3f0ece0a30ec8e69b4742")
 LASTFM_API_SECRET  = os.getenv("LAST_FM_API_SECRET") or os.getenv("LASTFM_API_SECRET", "")
@@ -216,7 +220,7 @@ def _cache_valid(ts, ttl):
 def _abs_image(url):
     """Gör relativ LMS-bild-URL absolut."""
     if url and url.startswith('/'):
-        return f"http://{LMS_HOST}:9000{url}"
+        return f"{LMS_HTTP}{url}"
     return url or ""
 
 def _act_on_active(command_fn):
@@ -638,7 +642,7 @@ def search_library():
                     'title':  item.get('album'),
                     'artist': item.get('artist'),
                     'year':   item.get('year'),
-                    'art':    f"http://{LMS_HOST}:9000/music/{cover_id}/cover.jpg"
+                    'art':    f"{LMS_HTTP}/music/{cover_id}/cover.jpg"
                               if cover_id else None,
                 })
 
@@ -700,7 +704,7 @@ def get_artist_albums():
                 'title':  item.get('album'),
                 'artist': item.get('artist'),
                 'year':   item.get('year'),
-                'art':    f"http://{LMS_HOST}:9000/music/{cover_id}/cover.jpg"
+                'art':    f"{LMS_HTTP}/music/{cover_id}/cover.jpg"
                           if cover_id else None,
             })
 
@@ -828,7 +832,7 @@ def get_album_art():
     player_mac, _ = get_player_info(request.args.get('room'))
     if not player_mac:
         return "/static/icon.png"
-    return f"http://{LMS_HOST}:9000/music/current/cover.jpg?player={player_mac}&time={int(time.time())}"
+    return f"{LMS_HTTP}/music/current/cover.jpg?player={player_mac}&time={int(time.time())}"
 
 @app.route('/status')
 def get_status():
@@ -852,7 +856,7 @@ def get_random_albums():
                 'id':     item.get('id'),
                 'title':  item.get('album'),
                 'artist': item.get('artist'),
-                'art':    f"http://{LMS_HOST}:9000/music/{cover_id}/cover.jpg"
+                'art':    f"{LMS_HTTP}/music/{cover_id}/cover.jpg"
             })
     return jsonify(albums)
 
@@ -1500,8 +1504,6 @@ def spy():
     return jsonify(lms_json_rpc(player_mac, ["spotty", "items", 0, 3, "item_id:0", "tags:asj"]))
 
 
-PLAYLIST_DIR = "/var/lib/squeezeboxserver/playlists"
-
 @app.route('/save_playlist', methods=['POST'])
 def save_playlist():
     """Sparar en spellista som .m3u på NAS och ber LMS skanna om."""
@@ -1921,14 +1923,17 @@ if __name__ == '__main__':
 
     logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
-    cert = os.path.join(os.path.dirname(__file__), 'certs', '10.0.1.132+2.pem')
-    key  = os.path.join(os.path.dirname(__file__), 'certs', '10.0.1.132+2-key.pem')
+    _certs = os.path.join(os.path.dirname(__file__), 'certs')
+    cert = os.getenv("BRIDGE_CERT", os.path.join(_certs, '10.0.1.132+2.pem'))
+    key  = os.getenv("BRIDGE_KEY",  os.path.join(_certs, '10.0.1.132+2-key.pem'))
 
-    http_server  = make_server('0.0.0.0', 5000, app, threaded=True)
-    https_server = make_server('0.0.0.0', 5001, app, ssl_context=(cert, key), threaded=True)
+    _http_port  = int(os.getenv("BRIDGE_PORT", "5000"))
+    _https_port = int(os.getenv("BRIDGE_HTTPS_PORT", "5001"))
+    http_server  = make_server('0.0.0.0', _http_port,  app, threaded=True)
+    https_server = make_server('0.0.0.0', _https_port, app, ssl_context=(cert, key), threaded=True)
 
-    print("--- Lyrionbridge v2: http://0.0.0.0:5000  (Edgar/intern) ---")
-    print("--- Lyrionbridge v2: https://0.0.0.0:5001 (iPhone PWA)   ---")
+    print(f"--- Lyrionbridge v2: http://0.0.0.0:{_http_port}  (Edgar/intern) ---")
+    print(f"--- Lyrionbridge v2: https://0.0.0.0:{_https_port} (iPhone PWA)   ---")
 
     threading.Thread(target=http_server.serve_forever, daemon=True).start()
     threading.Thread(target=_mix_label_loop, daemon=True, name="mix-labels").start()

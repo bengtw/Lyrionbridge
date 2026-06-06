@@ -1,2 +1,14 @@
 Waveshare Knob/
 Esp32-VolumeControl-Kitchen/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Lokala databaser (genereras lokalt, stora)
+*.db
+
+# Hemligheter / övrigt
+.env
+.DS_Store
