@@ -227,7 +227,7 @@ def _on_newsong(mac):
     if track["artist"] and track["title"]:
         threading.Thread(
             target=_estimate_and_store,
-            args=(row_id, track["artist"], track["title"], track.get("spotify_uri")),
+            args=(row_id, track["artist"], track["title"]),
             daemon=True,
         ).start()
         threading.Thread(
@@ -299,37 +299,6 @@ def _estimate_features_batch(tracks: list[tuple[str, str]]) -> dict:
         return {}
 
 
-_SPOTIFY_FEATURES_DB = os.path.join(os.path.dirname(__file__), "spotify_features.db")
-_spotify_feat_conn = None
-_spotify_feat_lock = threading.Lock()
-
-
-def _lookup_spotify_dataset(spotify_id: str) -> dict | None:
-    """Slår upp audio features i det lokala Kaggle-datasetet via Spotify track ID."""
-    global _spotify_feat_conn
-    if not os.path.exists(_SPOTIFY_FEATURES_DB):
-        return None
-    try:
-        with _spotify_feat_lock:
-            if _spotify_feat_conn is None:
-                _spotify_feat_conn = sqlite3.connect(_SPOTIFY_FEATURES_DB, check_same_thread=False)
-                _spotify_feat_conn.row_factory = sqlite3.Row
-            row = _spotify_feat_conn.execute(
-                "SELECT energy, valence, danceability, tempo FROM spotify_features WHERE spotify_id=?",
-                (spotify_id,),
-            ).fetchone()
-        if row and row["energy"] is not None:
-            return {
-                "energy":       row["energy"],
-                "valence":      row["valence"],
-                "danceability": row["danceability"],
-                "tempo":        row["tempo"],
-            }
-    except Exception as e:
-        print(f"[Features] Dataset-fel: {e}")
-    return None
-
-
 def _lookup_features_cache(artist: str, title: str) -> dict | None:
     with _db() as conn:
         row = conn.execute(
@@ -351,28 +320,14 @@ def _store_features_cache(artist: str, title: str, f: dict):
         )
 
 
-def _estimate_and_store(row_id: int, artist: str, title: str, spotify_uri: str | None = None):
+def _estimate_and_store(row_id: int, artist: str, title: str):
     """Estimerar features för ett enskilt spår och sparar i DB. Körs i bakgrundstråd."""
-    # 1. Lokalt Kaggle-dataset (exakt match via Spotify ID)
-    if spotify_uri:
-        sid = spotify_uri.split(":")[-1]
-        f = _lookup_spotify_dataset(sid)
-        if f:
-            print(f"[Features] {artist} — {title}: dataset-träff")
-            with _db() as conn:
-                conn.execute(
-                    "UPDATE plays SET energy=?, valence=?, danceability=?, tempo=? WHERE id=?",
-                    (f["energy"], f["valence"], f["danceability"], f["tempo"], row_id),
-                )
-            _store_features_cache(artist, title, f)
-            return
-
-    # 2. Lokal cache (artist+titel)
+    # 1. Lokal cache (artist+titel)
     f = _lookup_features_cache(artist, title)
     if f:
         print(f"[Features] {artist} — {title}: cache-träff")
     else:
-        # 3. Gemini-estimering
+        # 2. Gemini-estimering
         features = _estimate_features_batch([(artist, title)])
         f = features.get((artist, title))
         if not f:
@@ -397,25 +352,15 @@ def backfill_features(batch_size: int = 30):
         print("[Features] Alla spår har redan features.")
         return
 
-    print(f"[Features] Backfill: {len(rows)} spår saknar features — dataset + cache...")
-    dataset_hits = 0
+    print(f"[Features] Backfill: {len(rows)} spår saknar features — cache + Gemini...")
     cache_hits = 0
     needs_estimation = []
     with _db() as conn:
         for row in rows:
-            # 1. Kaggle-dataset via Spotify ID
-            f = None
-            if row["spotify_uri"]:
-                sid = row["spotify_uri"].split(":")[-1]
-                f = _lookup_spotify_dataset(sid)
-                if f:
-                    dataset_hits += 1
-            # 2. Lokal artist+titel-cache
-            if not f:
-                f = _lookup_features_cache(row["artist"], row["title"])
-                if f:
-                    cache_hits += 1
+            # 1. Lokal artist+titel-cache
+            f = _lookup_features_cache(row["artist"], row["title"])
             if f:
+                cache_hits += 1
                 conn.execute(
                     "UPDATE plays SET energy=?, valence=?, danceability=?, tempo=? WHERE id=?",
                     (f["energy"], f["valence"], f["danceability"], f["tempo"], row["id"]),
@@ -423,7 +368,7 @@ def backfill_features(batch_size: int = 30):
             else:
                 needs_estimation.append(row)
 
-    print(f"[Features] {dataset_hits} dataset, {cache_hits} cache, {len(needs_estimation)} behöver Gemini")
+    print(f"[Features] {cache_hits} cache, {len(needs_estimation)} behöver Gemini")
     if not needs_estimation:
         print("[Features] Backfill klar.")
         return
