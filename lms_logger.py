@@ -34,6 +34,7 @@ LMS_CLI_PORT = int(os.getenv("LMS_CLI_PORT", "9090"))
 LMS_PORT     = int(os.getenv("LMS_PORT", "9000"))
 LMS_JSON_URL = f"http://{LMS_HOST}:{LMS_PORT}/jsonrpc.js"
 DB_PATH      = Path(__file__).parent / "play_history.db"
+DJ_DB_PATH   = Path(__file__).parent.parent / "edgar" / "dj_data.db"  # musikgrafens katalog
 
 SKIP_THRESHOLD = 0.40  # Andel av spåret som måste spelas för att inte räknas som skip
 
@@ -396,6 +397,52 @@ def backfill_features(batch_size: int = 30):
     print(f"[Features] Backfill klar — {cache_hits} från cache, {updated} estimerade.")
 
 
+def backfill_catalog(limit: int = 1000, batch_size: int = 30):
+    """Estimerar audio features för spår ur musikgrafens katalog (graph_tracks i
+    dj_data.db) som ännu inte finns i track_features_cache. Ger scatter-grafen
+    fler prickar än bara spelhistoriken. Körs manuellt:
+        python3 lms_logger.py --backfill-catalog [N]
+    limit=0 → hela katalogen."""
+    if not DJ_DB_PATH.exists():
+        print(f"[Catalog] Hittar inte dj_data.db: {DJ_DB_PATH}")
+        return
+
+    with sqlite3.connect(DJ_DB_PATH) as dj:
+        catalog = dj.execute(
+            "SELECT DISTINCT artist, title FROM graph_tracks "
+            "WHERE artist != '' AND title != ''"
+        ).fetchall()
+
+    with _db() as conn:
+        cached = {
+            (r["artist"], r["title"])
+            for r in conn.execute("SELECT artist, title FROM track_features_cache").fetchall()
+        }
+
+    todo = [(a, t) for (a, t) in catalog if (a, t) not in cached]
+    print(f"[Catalog] {len(catalog)} katalogspår · {len(catalog) - len(todo)} redan cachade · {len(todo)} saknar features")
+    if limit:
+        todo = todo[:limit]
+    if not todo:
+        print("[Catalog] Inget att estimera.")
+        return
+
+    print(f"[Catalog] Estimerar {len(todo)} spår i batchar om {batch_size} (Gemini)...")
+    stored = 0
+    for i in range(0, len(todo), batch_size):
+        batch = todo[i:i + batch_size]
+        features = _estimate_features_batch(batch)
+        for key in batch:
+            f = features.get(key)
+            if f:
+                _store_features_cache(key[0], key[1], f)
+                stored += 1
+        print(f"[Catalog]   {min(i + batch_size, len(todo))}/{len(todo)} klart ({stored} sparade)...")
+        time.sleep(1)
+
+    print(f"[Catalog] Klar — {stored} spår fick features i track_features_cache.")
+
+
 # ---------------------------------------------------------------------------
 # Frågegränssnitt (används av lms_bridge.py endpoints)
 # ---------------------------------------------------------------------------
@@ -571,7 +618,13 @@ def _listen():
 if __name__ == "__main__":
     import sys
     init_db()
-    if "--backfill" in sys.argv:
+    if "--backfill-catalog" in sys.argv:
+        idx = sys.argv.index("--backfill-catalog")
+        limit = 1000
+        if idx + 1 < len(sys.argv) and sys.argv[idx + 1].isdigit():
+            limit = int(sys.argv[idx + 1])
+        backfill_catalog(limit=limit)
+    elif "--backfill" in sys.argv:
         backfill_features()
     else:
         print(f"[LMS Logger] Startar — loggar till {DB_PATH}")
