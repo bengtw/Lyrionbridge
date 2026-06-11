@@ -277,6 +277,8 @@ def _estimate_features_batch(tracks: list[tuple[str, str]]) -> dict:
         "Estimate Spotify-style audio features for these tracks.\n"
         "Return ONLY a JSON array, one object per track, with fields:\n"
         "  artist, title, energy (0.0-1.0), valence (0.0-1.0), danceability (0.0-1.0), tempo (BPM integer)\n"
+        "Give energy, valence and danceability to TWO decimals (e.g. 0.63, 0.27, 0.41). "
+        "Differentiate tracks precisely — avoid lazy round numbers like 0.5, 0.7 or 0.8.\n"
         "Match the order of the input list exactly.\n\n"
         f"Tracks:\n{track_list}"
     )
@@ -397,7 +399,7 @@ def backfill_features(batch_size: int = 30):
     print(f"[Features] Backfill klar — {cache_hits} från cache, {updated} estimerade.")
 
 
-def backfill_catalog(limit: int = 1000, batch_size: int = 30):
+def backfill_catalog(limit: int = 1000, batch_size: int = 10):
     """Estimerar audio features för spår ur musikgrafens katalog (graph_tracks i
     dj_data.db) som ännu inte finns i track_features_cache. Ger scatter-grafen
     fler prickar än bara spelhistoriken. Körs manuellt:
@@ -441,6 +443,45 @@ def backfill_catalog(limit: int = 1000, batch_size: int = 30):
         time.sleep(1)
 
     print(f"[Catalog] Klar — {stored} spår fick features i track_features_cache.")
+
+
+def reestimate_scatter(batch_size: int = 10):
+    """Re-estimerar (skriver ÖVER) features för alla spår scattern visar —
+    distinkta (artist,title) ur track_features_cache ∪ plays — med den skärpta
+    prompten + små batchar, så hela modellen blir enhetlig (slut på 0.1-stapling).
+    Körs manuellt: python3 lms_logger.py --reestimate-scatter"""
+    with _db() as conn:
+        cache_rows = conn.execute(
+            "SELECT artist, title FROM track_features_cache WHERE artist != '' AND title != ''"
+        ).fetchall()
+        play_rows = conn.execute(
+            "SELECT DISTINCT artist, title FROM plays "
+            "WHERE energy > 0 AND valence > 0 AND artist != '' AND title != ''"
+        ).fetchall()
+
+    # Prioritera cachens egen casing (så INSERT OR REPLACE ersätter på plats);
+    # lägg bara till plays-spår som saknas i cachen.
+    seen   = {(r["artist"].lower(), r["title"].lower()) for r in cache_rows}
+    tracks = [(r["artist"], r["title"]) for r in cache_rows]
+    for r in play_rows:
+        key = (r["artist"].lower(), r["title"].lower())
+        if key not in seen:
+            seen.add(key)
+            tracks.append((r["artist"], r["title"]))
+
+    print(f"[Reestimate] {len(tracks)} spår re-estimeras i batchar om {batch_size} (skärpt prompt)...")
+    stored = 0
+    for i in range(0, len(tracks), batch_size):
+        batch = tracks[i:i + batch_size]
+        features = _estimate_features_batch(batch)
+        for key in batch:
+            f = features.get(key)
+            if f:
+                _store_features_cache(key[0], key[1], f)
+                stored += 1
+        print(f"[Reestimate]   {min(i + batch_size, len(tracks))}/{len(tracks)} ({stored} omskrivna)...")
+        time.sleep(1)
+    print(f"[Reestimate] Klar — {stored} spår omskrivna med enhetlig modell.")
 
 
 # ---------------------------------------------------------------------------
@@ -618,7 +659,9 @@ def _listen():
 if __name__ == "__main__":
     import sys
     init_db()
-    if "--backfill-catalog" in sys.argv:
+    if "--reestimate-scatter" in sys.argv:
+        reestimate_scatter()
+    elif "--backfill-catalog" in sys.argv:
         idx = sys.argv.index("--backfill-catalog")
         limit = 1000
         if idx + 1 < len(sys.argv) and sys.argv[idx + 1].isdigit():
