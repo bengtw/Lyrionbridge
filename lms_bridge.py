@@ -25,6 +25,16 @@ def _load_dotenv(path):
 
 _load_dotenv(Path(__file__).parent.parent / "edgar" / ".env")
 
+# Logghandler så INFO faktiskt når journalen. Utan denna har root-loggern ingen
+# handler → lastResort släpper bara WARNING+ (vakthundens kill-rader, QueueTracks
+# PLAY/KÖ m.m. försvann tyst). Format speglar edgars _setup_logging.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logging.getLogger('werkzeug').setLevel(logging.ERROR)
+
 _session = requests.Session()
 _session.mount('http://', requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=10))
 
@@ -211,6 +221,22 @@ _active_players_cache = None
 _active_players_cache_time = 0
 _ACTIVE_PLAYERS_CACHE_TTL = 5
 
+# Spelar-vakthund. "Framsteg" = mode 'play' OCH spårets elapsed-tid tickar framåt
+# — en hängd spelare (typiskt vardagsrummet) kan rapportera mode 'play' men stå
+# still på elapsed, så enbart mode-koll räcker inte. Vakthunden återupplivar INTE
+# (ingen kick mitt i en låt — det är lika irriterande som hängningen); den dödar
+# bara det som inte kommer framåt. Två trösklar beroende på läge:
+#   - LÅS (mode 'play' men fryst): trasig ström → stop + rensa kö efter ~1 min.
+#   - PAUS/STOPP (mode != 'play'): kan vara medveten paus → vänta 1 h innan kö
+#     rensas, så inget spontant återupptas men en avsiktlig paus hinner återupptas.
+# Play-tid-kicken i _deferred_kick hanterar separat strömmar som aldrig startade.
+# Allt konfigurerbart via .env.
+_LOCK_KILL_SECONDS  = int(os.getenv("BRIDGE_LOCK_KILL_SECONDS", "60"))      # lås-tröskel
+_IDLE_FLUSH_SECONDS = int(os.getenv("BRIDGE_IDLE_FLUSH_SECONDS", "3600"))   # paus/stopp-tröskel
+_WATCHDOG_POLL      = int(os.getenv("BRIDGE_WATCHDOG_POLL", "10"))          # kollintervall
+_last_active_ts = {}   # mac → senaste tidpunkt spelaren faktiskt gjorde framsteg
+_last_elapsed   = {}   # mac → senast sedda elapsed-tid (för att upptäcka frysning)
+
 
 # --- HJÄLPFUNKTIONER ---
 
@@ -268,16 +294,31 @@ def lms_json_rpc(player_id, command_args, timeout=3):
         return None
 
 def _deferred_kick(player_mac, delay=5.0):
-    """Väntar delay sekunder, kollar om spelaren faktiskt spelar — annars kickar vi igång den."""
+    """Väntar delay sekunder efter ett play-kommando och kollar att uppspelningen
+    faktiskt kom igång. Två fel-lägen hanteras:
+      - mode != 'play' med spår i kön → spelaren startade aldrig → ['play'].
+      - mode == 'play' men elapsed står kvar på ~0 → strömmen hängde sig vid start
+        (klassiska vardagsrumshängningen) → ['playlist','jump',cur_index] tvingar
+        omladdning och väcker strömmen. Detta är samma mjuka kick som vakthunden gör.
+    Eftersom vi vet att vi precis startat uppspelning är elapsed ≈ 0 förväntat bara
+    om inget ljud kommit — en spelare som verkligen spelar har hunnit ~delay sekunder."""
     def _kick():
         time.sleep(delay)
         res = lms_json_rpc(player_mac, ["status", "-", 1, "tags:"])
-        if res:
-            mode = res.get("result", {}).get("mode")
-            playlist_tracks = res.get("result", {}).get("playlist_tracks", 0)
-            if mode != "play" and playlist_tracks > 0:
-                print(f"[KICK] {player_mac} mode={mode!r} men {playlist_tracks} spår i kön — kickar igång")
-                lms_json_rpc(player_mac, ["play"])
+        if not res:
+            return
+        r = res.get("result", {})
+        mode = r.get("mode")
+        playlist_tracks = r.get("playlist_tracks", 0)
+        if playlist_tracks <= 0:
+            return
+        if mode != "play":
+            logging.info(f"[kick] {player_mac} mode={mode!r}, {playlist_tracks} spår i kön — startar (play)")
+            lms_json_rpc(player_mac, ["play"])
+        elif (r.get("time") or 0) < 1.0:
+            cur_index = r.get("playlist_cur_index", 0)
+            logging.info(f"[kick] {player_mac} 'play' men fryst på elapsed≈0 — kickar (playlist jump {cur_index})")
+            lms_json_rpc(player_mac, ["playlist", "jump", cur_index])
     threading.Thread(target=_kick, daemon=True).start()
 
 def lms_play_stream(player_mac, play_command):
@@ -437,6 +478,158 @@ def _query_player_status(p):
     loop = r.get('playlist_loop', [])
     track = {'title': loop[0].get('title', ''), 'artist': loop[0].get('artist', '')} if loop else {}
     return {'room': p.get('name'), 'mac': mac, 'mode': 'play', 'track': track}
+
+
+_LOCK_DB = Path(__file__).parent / "play_history.db"
+
+
+def _init_lock_events():
+    """Skapar lock_events-tabellen i play_history.db (delas med lms_logger).
+    En rad per gång vakthunden dödar en spelare — forensik för 'varför dör saker'."""
+    try:
+        with sqlite3.connect(_LOCK_DB) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS lock_events (
+                    ts              INTEGER NOT NULL,
+                    player          TEXT,
+                    mac             TEXT,
+                    model           TEXT,
+                    event           TEXT,     -- 'lock' (fryst play) | 'idle' (paus/stopp)
+                    mode            TEXT,
+                    froze_at        REAL,     -- elapsed-tid där den fastnade (0 = startade aldrig)
+                    frozen_for      INTEGER,  -- sekunder utan framsteg innan vi dödade
+                    playlist_tracks INTEGER,
+                    cur_index       INTEGER,
+                    signalstrength  INTEGER,
+                    artist          TEXT,
+                    title           TEXT,
+                    url             TEXT,
+                    source          TEXT      -- URL-schema: spotify / file / http ...
+                )
+            """)
+    except Exception as e:
+        logging.warning(f"[watchdog] kunde inte skapa lock_events: {e}")
+
+
+_init_lock_events()
+
+
+def _record_lock_event(p, r, event, froze_at, frozen_for):
+    """Fångar tillståndet vid ett vakthund-dödande: rik journal-rad + DB-rad.
+    Anropas före stop/clear så vi ser vad som faktiskt hängde."""
+    mac   = p.get('playerid', '')
+    name  = p.get('name', mac)
+    model = p.get('model', '')
+    # Hämta rik spårinfo (URL behövs för att se om det alltid är spotify://).
+    artist = title = url = ""
+    try:
+        rich = lms_json_rpc(mac, ["status", "-", 1, "tags:alu"])
+        loop = (rich or {}).get("result", {}).get("playlist_loop", [])
+        if loop:
+            t = loop[0]
+            artist, title, url = t.get("artist", ""), t.get("title", ""), t.get("url", "")
+    except Exception:
+        pass
+    source = url.split(":", 1)[0] if "://" in url else (url.split(":", 1)[0] if ":" in url else "")
+    mode   = r.get("mode")
+    pl_tracks = r.get("playlist_tracks", 0)
+    cur_index = r.get("playlist_cur_index", 0)
+    signal    = r.get("signalstrength", 0)
+
+    logging.info(
+        f"[watchdog] LOCK-EVENT {name} ({model}) event={event} "
+        f"froze_at={froze_at}s frozen_for={frozen_for}s source={source!r} "
+        f"signal={signal} spår={pl_tracks}@{cur_index} «{artist} – {title}»"
+    )
+    try:
+        with sqlite3.connect(_LOCK_DB, timeout=5) as conn:
+            conn.execute(
+                "INSERT INTO lock_events (ts, player, mac, model, event, mode, froze_at, "
+                "frozen_for, playlist_tracks, cur_index, signalstrength, artist, title, url, source) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (int(time.time()), name, mac, model, event, mode, froze_at, frozen_for,
+                 pl_tracks, cur_index, signal, artist, title, url, source),
+            )
+    except Exception as e:
+        logging.warning(f"[watchdog] kunde inte logga lock_event: {e}")
+
+
+def _watchdog_tick():
+    """Ett varv: döda spelare som inte kommer framåt. Lås (mode 'play' men fryst)
+    rensas efter _LOCK_KILL_SECONDS, paus/stopp efter _IDLE_FLUSH_SECONDS. Ingen
+    återupplivning. Anropas av _watchdog_loop var _WATCHDOG_POLL:e sekund."""
+    now = time.time()
+    seen = set()
+    for p in get_all_players():
+        mac = p.get('playerid')
+        if not mac:
+            continue
+        seen.add(mac)
+        res = lms_json_rpc(mac, ["status", "-", 1, "tags:"])
+        if not res or 'result' not in res:
+            continue
+        r = res['result']
+        mode = r.get('mode')
+        playlist_tracks = r.get('playlist_tracks', 0)
+        elapsed = r.get('time', 0)
+        name = p.get('name', mac)
+
+        prev_elapsed = _last_elapsed.get(mac)
+        _last_elapsed[mac] = elapsed
+        # Framsteg = spelar OCH elapsed har rört sig sedan förra koll. Vid första
+        # sikte (prev_elapsed is None) litar vi på mode för att inte agera i onödan.
+        making_progress = mode == 'play' and (prev_elapsed is None or elapsed != prev_elapsed)
+
+        if making_progress:
+            _last_active_ts[mac] = now
+            continue
+
+        baseline = _last_active_ts.get(mac)
+        if baseline is None:
+            # Aldrig sedd aktiv ännu — starta klockan nu, agera inte retroaktivt.
+            _last_active_ts[mac] = now
+            continue
+
+        if playlist_tracks <= 0:
+            continue
+
+        frozen_for = now - baseline
+        # Lås (rapporterar 'play' men står still) är en trasig ström → döda snabbt.
+        # Paus/stopp kan vara medvetet → ge en timme innan kön rensas.
+        is_lock = mode == 'play'
+        threshold = _LOCK_KILL_SECONDS if is_lock else _IDLE_FLUSH_SECONDS
+
+        if frozen_for >= threshold:
+            reason = "låst ström" if is_lock else f"inaktiv (mode={mode!r})"
+            logging.info(
+                f"[watchdog] {name} ({mac}) {reason} i {int(frozen_for)}s, "
+                f"{playlist_tracks} spår — rensar kö + stop"
+            )
+            _record_lock_event(
+                p, r,
+                event="lock" if is_lock else "idle",
+                froze_at=elapsed, frozen_for=int(frozen_for),
+            )
+            lms_json_rpc(mac, ["stop"])
+            lms_json_rpc(mac, ["playlist", "clear"])
+            _last_active_ts[mac] = now   # nollställ klockan efter åtgärd
+            _last_elapsed.pop(mac, None)
+
+    # Glöm spelare som försvunnit (avstängda) så dictarna inte växer obegränsat.
+    for mac in list(_last_active_ts.keys()):
+        if mac not in seen:
+            _last_active_ts.pop(mac, None)
+            _last_elapsed.pop(mac, None)
+
+
+def _watchdog_loop():
+    time.sleep(_WATCHDOG_POLL)
+    while True:
+        try:
+            _watchdog_tick()
+        except Exception as e:
+            logging.warning(f"[watchdog] fel: {e}")
+        time.sleep(_WATCHDOG_POLL)
 
 
 # --- LAST.FM LÄSNING ---
@@ -1866,9 +2059,45 @@ def skip_track():
     return jsonify({"artist": artist, "title": title, "db": db_ok})
 
 
+def _playlist_count(mac):
+    """Aktuellt antal spår i en spelares kö."""
+    res = lms_json_rpc(mac, ["status", "-", 1, "tags:"])
+    return (res or {}).get("result", {}).get("playlist_tracks", 0) or 0
+
+
+def _wait_for_count(mac, want, timeout=2.0):
+    """Pollar tills kön har minst `want` spår eller timeout. Spotty löser URI:er
+    asynkront — räkningen uppdateras först när spåret faktiskt landat."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _playlist_count(mac) >= want:
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def _add_spotify_verified(mac, track_id, action, want, retries=3):
+    """Lägger till ett Spotify-spår och verifierar att det faktiskt landade i kön.
+    Under Spotty cold-start/throttle slänger LMS tyst URI:er den inte hinner lösa
+    (se CLAUDE.md) — vi bekräftar via playlist_tracks och försöker om vid behov.
+
+    `action` är 'play' (första spåret: clear+spela) eller 'add' (append). Retry på
+    'add' kan i sällsynta fall ge en dubblett om Spotty landar precis efter timeout,
+    men ett extra spår är bättre än ett tappat."""
+    is_uri = track_id.startswith("spotify://")
+    cmd = (["playlist", action, track_id] if is_uri
+           else ["spotty", "playlist", action, f"item_id:{track_id}"])
+    for _ in range(retries):
+        lms_json_rpc(mac, cmd, timeout=8)
+        if _wait_for_count(mac, want, timeout=2.0):
+            return True
+    return _playlist_count(mac) >= want
+
+
 @app.route('/queue-tracks', methods=['POST'])
 def queue_tracks():
-    """Köar lösta spår till en spelare. Hanterar Spotty-throttle internt.
+    """Köar lösta spår till en spelare. Hanterar Spotty-throttle/cold-start internt
+    genom att verifiera att varje spår landat innan nästa läggs till.
 
     Body: {
       "room":   "spelarnamn eller MAC",
@@ -1893,29 +2122,38 @@ def queue_tracks():
         lms_json_rpc(mac, ["playlist", "shuffle", "0"])
         lms_json_rpc(mac, ["playlist", "clear"])
 
-    queued = []
+    # Spåra faktiskt landat antal — ett tappat spår ökar inte räkningen, så nästa
+    # spår siktar fortfarande mot rätt index.
+    landed = 0 if mode == "load" else _playlist_count(mac)
+
+    queued, dropped = [], []
     for i, track in enumerate(tracks):
         source   = track.get("source", "lms")
         track_id = track.get("id", "")
         first    = (mode == "load" and i == 0)
+        want     = landed + 1
         try:
             if source == "spotify":
                 action = "play" if first else "add"
-                cmd = (["playlist", action, track_id] if track_id.startswith("spotify://")
-                       else ["spotty", "playlist", action, f"item_id:{track_id}"])
-                lms_json_rpc(mac, cmd, timeout=8)
-                if not first:
-                    time.sleep(0.3)   # Spotty-throttle: max ~3 URI:er/sekund
+                ok = _add_spotify_verified(mac, track_id, action, want)
             else:
                 cmd_type = "load" if first else "add"
                 lms_json_rpc(mac, ["playlistcontrol", f"cmd:{cmd_type}", f"track_id:{track_id}"])
-            queued.append({"artist": track.get("artist", ""), "title": track.get("title", "")})
-            print(f"[QueueTracks] {'PLAY' if first else 'KÖ  '} {source:7s} "
-                  f"{track.get('artist','?')} – {track.get('title','?')}")
-        except Exception as e:
-            print(f"[QueueTracks] Fel: {track.get('artist')} – {track.get('title')}: {e}")
+                ok = _wait_for_count(mac, want, timeout=1.5)
 
-    return jsonify({"queued": len(queued), "tracks": queued})
+            landed = _playlist_count(mac)   # resynka mot verkligheten
+            if ok:
+                queued.append({"artist": track.get("artist", ""), "title": track.get("title", "")})
+                logging.info(f"[QueueTracks] {'PLAY' if first else 'KÖ  '} {source:7s} "
+                             f"{track.get('artist','?')} – {track.get('title','?')}")
+            else:
+                dropped.append({"artist": track.get("artist", ""), "title": track.get("title", "")})
+                logging.warning(f"[QueueTracks] TAPPAD (Spotty löste inte efter retries) {source:7s} "
+                                f"{track.get('artist','?')} – {track.get('title','?')}")
+        except Exception as e:
+            logging.error(f"[QueueTracks] Fel: {track.get('artist')} – {track.get('title')}: {e}")
+
+    return jsonify({"queued": len(queued), "dropped": len(dropped), "tracks": queued})
 
 
 if __name__ == '__main__':
@@ -1937,4 +2175,5 @@ if __name__ == '__main__':
 
     threading.Thread(target=http_server.serve_forever, daemon=True).start()
     threading.Thread(target=_mix_label_loop, daemon=True, name="mix-labels").start()
+    threading.Thread(target=_watchdog_loop, daemon=True, name="watchdog").start()
     https_server.serve_forever()
