@@ -514,6 +514,42 @@ def _init_lock_events():
 _init_lock_events()
 
 
+def _init_resolved_tracks():
+    """Persistent (artist, title) → upplöst spår-id. Skrivs vid VARJE lyckad
+    upplösning (inte bara vid play, som plays.spotify_uri). Den stabila
+    spotify://-URI:n är permanent, så ingen TTL — bara invalidering vid play-fel."""
+    try:
+        with sqlite3.connect(_LOCK_DB) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS resolved_tracks (
+                    artist_norm TEXT NOT NULL,
+                    title_norm  TEXT NOT NULL,
+                    source      TEXT NOT NULL,   -- 'spotify' | 'lms'
+                    track_id    TEXT NOT NULL,   -- spotify://track:XXX eller lms track_id
+                    resolved_at INTEGER NOT NULL,
+                    PRIMARY KEY (artist_norm, title_norm)
+                )
+            """)
+    except Exception as e:
+        logging.warning(f"[cache] kunde inte skapa resolved_tracks: {e}")
+
+
+_init_resolved_tracks()
+
+
+def _invalidate_resolved(artist: str, title: str):
+    """Tar bort en cachad upplösning (self-healing: spåret gick inte att spela,
+    så låt det re-resolvas nästa gång)."""
+    a, t = (artist or "").strip().lower(), (title or "").strip().lower()
+    if not (a and t):
+        return
+    try:
+        with sqlite3.connect(_LOCK_DB, timeout=5) as conn:
+            conn.execute("DELETE FROM resolved_tracks WHERE artist_norm=? AND title_norm=?", (a, t))
+    except Exception as e:
+        logging.warning(f"[cache] invalidate fel: {e}")
+
+
 def _record_lock_event(p, r, event, froze_at, frozen_for):
     """Fångar tillståndet vid ett vakthund-dödande: rik journal-rad + DB-rad.
     Anropas före stop/clear så vi ser vad som faktiskt hängde."""
@@ -1888,23 +1924,60 @@ def play_history_data_endpoint():
 
 @app.route('/resolved_uris')
 def resolved_uris():
-    """Returnerar alla Spotify-URIs som lms_logger har upplöst för (artist, title)-par.
-    Används av edgar för att förvärma sin in-memory track_cache vid start."""
+    """Returnerar upplösta spår-id:n för (artist, title)-par. Edgar förvärmer sin
+    in-memory track_cache med detta vid start. Två källor unionas:
+      - resolved_tracks: alla upplösningar (spotify + lms), den dedikerade cachen
+      - plays.spotify_uri: spår som faktiskt spelats (historik före cachen fanns)
+    Format: [{artist, title, source, id}]. 'uri' behålls som alias för bakåtkompat."""
     db_path = Path(__file__).parent / "play_history.db"
     if not db_path.exists():
         return jsonify([])
+    out = []
     try:
         with sqlite3.connect(db_path) as conn:
-            rows = conn.execute("""
-                SELECT DISTINCT lower(artist) AS artist, lower(title) AS title, spotify_uri
+            # plays FÖRST — resolved_tracks läggs sist så den (auktoritativa, ev.
+            # nyss re-resolvade) cachen vinner i edgars last-write-wins-laddning.
+            for a, t, u in conn.execute("""
+                SELECT DISTINCT lower(artist), lower(title), spotify_uri
                 FROM plays
                 WHERE spotify_uri IS NOT NULL AND spotify_uri != ''
                   AND artist IS NOT NULL AND title IS NOT NULL
-            """).fetchall()
-        return jsonify([{"artist": a, "title": t, "uri": u} for a, t, u in rows])
+            """).fetchall():
+                out.append({"artist": a, "title": t, "source": "spotify", "id": u, "uri": u})
+            try:
+                for a, t, s, i in conn.execute(
+                    "SELECT artist_norm, title_norm, source, track_id FROM resolved_tracks"
+                ).fetchall():
+                    out.append({"artist": a, "title": t, "source": s, "id": i, "uri": i})
+            except sqlite3.OperationalError:
+                pass  # tabellen finns inte än
     except Exception as e:
         logging.warning("[resolved_uris] DB-fel: %s", e)
-        return jsonify([])
+    return jsonify(out)
+
+
+@app.route('/cache_resolved', methods=['POST'])
+def cache_resolved():
+    """Persisterar en upplösning så den överlever omstart. Anropas av edgar vid
+    varje lyckad (artist, title) → (source, id)-upplösning."""
+    data     = request.get_json(silent=True) or {}
+    artist   = (data.get("artist") or "").strip().lower()
+    title    = (data.get("title")  or "").strip().lower()
+    source   = (data.get("source") or "").strip()
+    track_id = (data.get("id") or data.get("track_id") or "").strip()
+    if not (artist and title and source and track_id):
+        return jsonify({"error": "artist, title, source, id krävs"}), 400
+    try:
+        with sqlite3.connect(_LOCK_DB, timeout=5) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO resolved_tracks "
+                "(artist_norm, title_norm, source, track_id, resolved_at) VALUES (?,?,?,?,?)",
+                (artist, title, source, track_id, int(time.time())),
+            )
+        return jsonify({"ok": True})
+    except Exception as e:
+        logging.warning(f"[cache] /cache_resolved fel: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/mark_origin', methods=['POST'])
@@ -2150,6 +2223,7 @@ def queue_tracks():
                 dropped.append({"artist": track.get("artist", ""), "title": track.get("title", "")})
                 logging.warning(f"[QueueTracks] TAPPAD (Spotty löste inte efter retries) {source:7s} "
                                 f"{track.get('artist','?')} – {track.get('title','?')}")
+                _invalidate_resolved(track.get("artist", ""), track.get("title", ""))
         except Exception as e:
             logging.error(f"[QueueTracks] Fel: {track.get('artist')} – {track.get('title')}: {e}")
 
