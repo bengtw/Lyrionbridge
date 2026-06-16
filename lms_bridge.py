@@ -236,6 +236,7 @@ _IDLE_FLUSH_SECONDS = int(os.getenv("BRIDGE_IDLE_FLUSH_SECONDS", "3600"))   # pa
 _WATCHDOG_POLL      = int(os.getenv("BRIDGE_WATCHDOG_POLL", "10"))          # kollintervall
 _last_active_ts = {}   # mac → senaste tidpunkt spelaren faktiskt gjorde framsteg
 _last_elapsed   = {}   # mac → senast sedda elapsed-tid (för att upptäcka frysning)
+_last_track     = {}   # mac → nuvarande spårs identitet (url) — nytt spår = färsk frist
 
 
 # --- HJÄLPFUNKTIONER ---
@@ -293,32 +294,35 @@ def lms_json_rpc(player_id, command_args, timeout=3):
         print(f"[ERROR] LMS: {e}")
         return None
 
-def _deferred_kick(player_mac, delay=5.0):
-    """Väntar delay sekunder efter ett play-kommando och kollar att uppspelningen
-    faktiskt kom igång. Två fel-lägen hanteras:
-      - mode != 'play' med spår i kön → spelaren startade aldrig → ['play'].
-      - mode == 'play' men elapsed står kvar på ~0 → strömmen hängde sig vid start
-        (klassiska vardagsrumshängningen) → ['playlist','jump',cur_index] tvingar
-        omladdning och väcker strömmen. Detta är samma mjuka kick som vakthunden gör.
-    Eftersom vi vet att vi precis startat uppspelning är elapsed ≈ 0 förväntat bara
-    om inget ljud kommit — en spelare som verkligen spelar har hunnit ~delay sekunder."""
+def _deferred_kick(player_mac, delay=5.0, attempts=4):
+    """Efter ett play-kommando: säkerställ att uppspelningen faktiskt kom igång,
+    annars knuffa. Gör upp till `attempts` försök med `delay`s mellanrum — Spotty
+    cold-start kan behöva mer än en knuff (men hela serien ryms inom vakthundens
+    60s-lås-fönster). Fel-lägen:
+      - mode != 'play' → spelaren startade aldrig → ['play'].
+      - mode == 'play' men elapsed ≈ 0 → strömmen hängde vid start → ['playlist',
+        'jump',cur_index] tvingar omladdning. Avbryter så fort elapsed tickar."""
     def _kick():
-        time.sleep(delay)
-        res = lms_json_rpc(player_mac, ["status", "-", 1, "tags:"])
-        if not res:
-            return
-        r = res.get("result", {})
-        mode = r.get("mode")
-        playlist_tracks = r.get("playlist_tracks", 0)
-        if playlist_tracks <= 0:
-            return
-        if mode != "play":
-            logging.info(f"[kick] {player_mac} mode={mode!r}, {playlist_tracks} spår i kön — startar (play)")
-            lms_json_rpc(player_mac, ["play"])
-        elif (r.get("time") or 0) < 1.0:
+        for _ in range(attempts):
+            time.sleep(delay)
+            res = lms_json_rpc(player_mac, ["status", "-", 1, "tags:"])
+            if not res:
+                continue
+            r = res.get("result", {})
+            mode = r.get("mode")
+            playlist_tracks = r.get("playlist_tracks", 0)
+            elapsed = r.get("time") or 0
+            if playlist_tracks <= 0:
+                return
+            if mode == "play" and elapsed > 1.0:
+                return  # spelar och tickar — klart
             cur_index = r.get("playlist_cur_index", 0)
-            logging.info(f"[kick] {player_mac} 'play' men fryst på elapsed≈0 — kickar (playlist jump {cur_index})")
-            lms_json_rpc(player_mac, ["playlist", "jump", cur_index])
+            if mode != "play":
+                logging.info(f"[kick] {player_mac} mode={mode!r}, {playlist_tracks} spår — startar (play)")
+                lms_json_rpc(player_mac, ["play"])
+            else:
+                logging.info(f"[kick] {player_mac} 'play' men fryst på elapsed≈{elapsed} — kickar (playlist jump {cur_index})")
+                lms_json_rpc(player_mac, ["playlist", "jump", cur_index])
     threading.Thread(target=_kick, daemon=True).start()
 
 def lms_play_stream(player_mac, play_command):
@@ -601,7 +605,7 @@ def _watchdog_tick():
         if not mac:
             continue
         seen.add(mac)
-        res = lms_json_rpc(mac, ["status", "-", 1, "tags:"])
+        res = lms_json_rpc(mac, ["status", "-", 1, "tags:u"])
         if not res or 'result' not in res:
             continue
         r = res['result']
@@ -609,14 +613,21 @@ def _watchdog_tick():
         playlist_tracks = r.get('playlist_tracks', 0)
         elapsed = r.get('time', 0)
         name = p.get('name', mac)
+        loop = r.get('playlist_loop', [])
+        track_key = (loop[0].get('url') or loop[0].get('id')) if loop else None
 
         prev_elapsed = _last_elapsed.get(mac)
         _last_elapsed[mac] = elapsed
         # Framsteg = spelar OCH elapsed har rört sig sedan förra koll. Vid första
         # sikte (prev_elapsed is None) litar vi på mode för att inte agera i onödan.
         making_progress = mode == 'play' and (prev_elapsed is None or elapsed != prev_elapsed)
+        # Nytt spår laddat → färsk frist. Annars dödas en kallstartande ström direkt
+        # om spelaren stått idle/pausad länge innan (stale _last_active_ts-klocka).
+        prev_track = _last_track.get(mac)
+        _last_track[mac] = track_key
+        track_changed = track_key is not None and track_key != prev_track
 
-        if making_progress:
+        if making_progress or track_changed:
             _last_active_ts[mac] = now
             continue
 
@@ -650,12 +661,14 @@ def _watchdog_tick():
             lms_json_rpc(mac, ["playlist", "clear"])
             _last_active_ts[mac] = now   # nollställ klockan efter åtgärd
             _last_elapsed.pop(mac, None)
+            _last_track.pop(mac, None)
 
     # Glöm spelare som försvunnit (avstängda) så dictarna inte växer obegränsat.
     for mac in list(_last_active_ts.keys()):
         if mac not in seen:
             _last_active_ts.pop(mac, None)
             _last_elapsed.pop(mac, None)
+            _last_track.pop(mac, None)
 
 
 def _watchdog_loop():
@@ -1989,8 +2002,12 @@ def mark_origin():
     tracks = data.get("tracks") or []
     if not origin or not tracks:
         return jsonify({"error": "origin och tracks krävs"}), 400
+    # Genererande kontext (mood/prompt_type/energy) — valfritt, mest för nydj.
+    ctx = data.get("context") or None
+    ctx_json = json.dumps(ctx, ensure_ascii=False) if isinstance(ctx, dict) and ctx else None
+    now = int(time.time())
     rows = [
-        (t["artist"].lower(), t["title"].lower(), origin, int(time.time()))
+        (t["artist"].lower(), t["title"].lower(), origin, now, ctx_json)
         for t in tracks
         if t.get("artist") and t.get("title")
     ]
@@ -1999,10 +2016,17 @@ def mark_origin():
     db_path = Path(__file__).parent / "play_history.db"
     try:
         with sqlite3.connect(db_path) as conn:
-            conn.executemany(
-                "INSERT INTO pending_origins (artist_lower, title_lower, origin, ts) VALUES (?,?,?,?)",
-                rows,
-            )
+            try:
+                conn.executemany(
+                    "INSERT INTO pending_origins (artist_lower, title_lower, origin, ts, context) "
+                    "VALUES (?,?,?,?,?)", rows,
+                )
+            except sqlite3.OperationalError:
+                # context-kolumnen finns inte än (lms_logger ej migrerad) → skriv utan
+                conn.executemany(
+                    "INSERT INTO pending_origins (artist_lower, title_lower, origin, ts) "
+                    "VALUES (?,?,?,?)", [r[:4] for r in rows],
+                )
         return jsonify({"written": len(rows)})
     except Exception as e:
         logging.warning("[mark_origin] DB-fel: %s", e)
@@ -2157,9 +2181,17 @@ def _add_spotify_verified(mac, track_id, action, want, retries=3):
     `action` är 'play' (första spåret: clear+spela) eller 'add' (append). Retry på
     'add' kan i sällsynta fall ge en dubblett om Spotty landar precis efter timeout,
     men ett extra spår är bättre än ett tappat."""
-    is_uri = track_id.startswith("spotify://")
-    cmd = (["playlist", action, track_id] if is_uri
-           else ["spotty", "playlist", action, f"item_id:{track_id}"])
+    # Acceptera BÅDA Spotify-URI-formaten: spotify://track:XXX (färska sökningar) och
+    # spotify:track:XXX (det format LMS lagrar för spelade spår → plays.spotify_uri →
+    # warm-cachen). Normalisera till dubbel-slash som 'playlist add' vill ha. Bara äkta
+    # positionella item_id:n (1.0_…) går till spotty item_id-grenen.
+    # (Tidigare föll spotify:track: tyst till item_id-grenen → varje cache-träff på ett
+    #  spelat spår TAPPADes.)
+    if track_id.startswith("spotify:"):
+        uri = track_id if track_id.startswith("spotify://") else "spotify://" + track_id[len("spotify:"):]
+        cmd = ["playlist", action, uri]
+    else:
+        cmd = ["spotty", "playlist", action, f"item_id:{track_id}"]
     for _ in range(retries):
         lms_json_rpc(mac, cmd, timeout=8)
         if _wait_for_count(mac, want, timeout=2.0):
@@ -2226,6 +2258,12 @@ def queue_tracks():
                 _invalidate_resolved(track.get("artist", ""), track.get("title", ""))
         except Exception as e:
             logging.error(f"[QueueTracks] Fel: {track.get('artist')} – {track.get('title')}: {e}")
+
+    # Vid load: säkerställ att openern faktiskt börjar spela (Spotty cold-start kan
+    # hänga på elapsed=0 fast mode='play'). _deferred_kick knuffar med 'playlist jump'
+    # inom vakthundens 60s-fönster. Streaming-vägen anropade aldrig detta förut.
+    if mode == "load" and queued:
+        _deferred_kick(mac)
 
     return jsonify({"queued": len(queued), "dropped": len(dropped), "tracks": queued})
 

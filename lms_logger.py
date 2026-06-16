@@ -75,6 +75,16 @@ def init_db():
         # Migrera: lägg till origin-kolumn om den saknas
         if "origin" not in cols:
             conn.execute("ALTER TABLE plays ADD COLUMN origin TEXT")
+        # played_seconds: hur länge spåret faktiskt spelade (engagemangsgradient,
+        # rikare än binära skipped). NULL = okänt (gammal data / pågår fortfarande).
+        if "played_seconds" not in cols:
+            conn.execute("ALTER TABLE plays ADD COLUMN played_seconds INTEGER")
+        # DJ-genererande kontext (för nydj-plays): vilken stämning/typ/energi som
+        # skapade spåret. NULL för manuella/gamla. Skilj från audio-energy ovan —
+        # ctx_energy är PROMPTENS målnivå, inte spårets uppmätta.
+        for col, typ in [("ctx_mood","TEXT"), ("ctx_prompt_type","TEXT"), ("ctx_energy","REAL")]:
+            if col not in cols:
+                conn.execute(f"ALTER TABLE plays ADD COLUMN {col} {typ}")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS pending_origins (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,6 +94,11 @@ def init_db():
                 ts           INTEGER NOT NULL
             )
         """)
+        # context: JSON med genererande kontext (mood/prompt_type/energy) som edgar
+        # skickar med — lyfts över till plays.ctx_* när spåret matchas.
+        po_cols = [r[1] for r in conn.execute("PRAGMA table_info(pending_origins)").fetchall()]
+        if "context" not in po_cols:
+            conn.execute("ALTER TABLE pending_origins ADD COLUMN context TEXT")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS track_features_cache (
                 artist       TEXT    NOT NULL,
@@ -164,9 +179,21 @@ _state_lock = threading.Lock()
 
 
 def _on_stop(mac):
-    """Spelare stoppades — rensa state utan att markera föregående spår som skippad."""
+    """Spelare stoppades — spara faktisk speltid för pågående spår, men markera det
+    INTE som skippat (stopp = 'klar för stunden', inte avvisning)."""
+    now = int(time.time())
     with _state_lock:
-        _state.pop(mac, None)
+        prev = _state.pop(mac, None)
+    if prev and prev.get("row_id"):
+        played = now - prev["ts_start"]
+        if prev.get("duration"):
+            played = min(played, prev["duration"])
+        try:
+            with _db() as conn:
+                conn.execute("UPDATE plays SET played_seconds=? WHERE id=? AND played_seconds IS NULL",
+                             (int(played), prev["row_id"]))
+        except Exception as e:
+            print(f"[LMS Logger] _on_stop played_seconds-fel: {e}")
 
 
 def _notify_alma(artist: str, title: str, source: str):
@@ -193,8 +220,11 @@ def _on_newsong(mac):
             prev = _state.get(mac)
         if prev:
             elapsed = now - prev["ts_start"]
-            if prev["duration"] > 20 and elapsed < prev["duration"] * SKIP_THRESHOLD:
-                conn.execute("UPDATE plays SET skipped=1 WHERE id=?", (prev["row_id"],))
+            # Spara faktisk speltid (kapad till spårlängden) — engagemangsgradient.
+            played = min(elapsed, prev["duration"]) if prev["duration"] else elapsed
+            skipped = 1 if (prev["duration"] > 20 and elapsed < prev["duration"] * SKIP_THRESHOLD) else 0
+            conn.execute("UPDATE plays SET played_seconds=?, skipped=? WHERE id=?",
+                         (int(played), skipped, prev["row_id"]))
 
         if not track:
             return
@@ -205,21 +235,31 @@ def _on_newsong(mac):
         # Det är den rena smaksignalen vi vill vikta upp. (Gammal data före denna ändring
         # ligger kvar som NULL.)
         origin = "manual"
+        ctx_mood = ctx_ptype = ctx_energy = None
         if track["artist"] and track["title"]:
             row = conn.execute("""
-                SELECT origin FROM pending_origins
+                SELECT origin, context FROM pending_origins
                 WHERE artist_lower=? AND title_lower=? AND ts > ?
                 ORDER BY ts DESC LIMIT 1
             """, (track["artist"].lower(), track["title"].lower(), now - 7200)).fetchone()
             if row:
                 origin = row["origin"]
+                if row["context"]:
+                    try:
+                        ctx = json.loads(row["context"])
+                        ctx_mood   = ctx.get("mood")
+                        ctx_ptype  = ctx.get("prompt_type")
+                        ctx_energy = ctx.get("energy")
+                    except Exception:
+                        pass
                 conn.execute("DELETE FROM pending_origins WHERE ts < ?", (now - 7200,))
 
         cur    = conn.execute(
-            "INSERT INTO plays (ts, player, artist, title, album, duration, source, spotify_uri, origin) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO plays (ts, player, artist, title, album, duration, source, spotify_uri, "
+            "origin, ctx_mood, ctx_prompt_type, ctx_energy) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (now, player, track["artist"], track["title"],
-             track["album"], track["duration"], track["source"], track["spotify_uri"], origin),
+             track["album"], track["duration"], track["source"], track["spotify_uri"],
+             origin, ctx_mood, ctx_ptype, ctx_energy),
         )
         row_id = cur.lastrowid
 
