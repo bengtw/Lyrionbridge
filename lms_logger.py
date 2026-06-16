@@ -79,6 +79,12 @@ def init_db():
         # rikare än binära skipped). NULL = okänt (gammal data / pågår fortfarande).
         if "played_seconds" not in cols:
             conn.execute("ALTER TABLE plays ADD COLUMN played_seconds INTEGER")
+        # interrupted_by_next: 1 = spåret avbröts av nästa spår (completion ratio är
+        # en valid preferenssignal), 0 = spelaren stoppades (played_seconds är bara
+        # 'hann så långt', INTE ett avvisande — får ej tolkas som halv-skip). NULL =
+        # gammal data / pågår. Krävs för att vikta played_seconds kontinuerligt.
+        if "interrupted_by_next" not in cols:
+            conn.execute("ALTER TABLE plays ADD COLUMN interrupted_by_next INTEGER")
         # DJ-genererande kontext (för nydj-plays): vilken stämning/typ/energi som
         # skapade spåret. NULL för manuella/gamla. Skilj från audio-energy ovan —
         # ctx_energy är PROMPTENS målnivå, inte spårets uppmätta.
@@ -190,7 +196,10 @@ def _on_stop(mac):
             played = min(played, prev["duration"])
         try:
             with _db() as conn:
-                conn.execute("UPDATE plays SET played_seconds=? WHERE id=? AND played_seconds IS NULL",
+                # interrupted_by_next=0: spelaren stoppades, inte avbröts av nästa spår.
+                # played_seconds är 'hann så långt', får inte tolkas som preferens.
+                conn.execute("UPDATE plays SET played_seconds=?, interrupted_by_next=0 "
+                             "WHERE id=? AND played_seconds IS NULL",
                              (int(played), prev["row_id"]))
         except Exception as e:
             print(f"[LMS Logger] _on_stop played_seconds-fel: {e}")
@@ -223,7 +232,9 @@ def _on_newsong(mac):
             # Spara faktisk speltid (kapad till spårlängden) — engagemangsgradient.
             played = min(elapsed, prev["duration"]) if prev["duration"] else elapsed
             skipped = 1 if (prev["duration"] > 20 and elapsed < prev["duration"] * SKIP_THRESHOLD) else 0
-            conn.execute("UPDATE plays SET played_seconds=?, skipped=? WHERE id=?",
+            # interrupted_by_next=1: avbröts av nästa spår → completion ratio
+            # (played_seconds/duration) är en valid kontinuerlig preferenssignal.
+            conn.execute("UPDATE plays SET played_seconds=?, skipped=?, interrupted_by_next=1 WHERE id=?",
                          (int(played), skipped, prev["row_id"]))
 
         if not track:
