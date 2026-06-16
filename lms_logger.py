@@ -199,8 +199,12 @@ def _on_newsong(mac):
         if not track:
             return
 
-        # Kolla om ursprung är känt via pending_origins
-        origin = None
+        # Ursprung: matchar pending_origins (skrivet av Edgars DJ/graf) → den taggen.
+        # Annars 'manual' — spåret initierades INTE av DJ:n, dvs användarens eget aktiva
+        # val (direkt i LMS, eller via Edgars direktspel som play_artist/play_album).
+        # Det är den rena smaksignalen vi vill vikta upp. (Gammal data före denna ändring
+        # ligger kvar som NULL.)
+        origin = "manual"
         if track["artist"] and track["title"]:
             row = conn.execute("""
                 SELECT origin FROM pending_origins
