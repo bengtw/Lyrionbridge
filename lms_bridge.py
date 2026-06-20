@@ -65,6 +65,13 @@ LASTFM_API_SECRET  = os.getenv("LAST_FM_API_SECRET") or os.getenv("LASTFM_API_SE
 LASTFM_SESSION_KEY = os.getenv("LASTFM_SESSION_KEY", "")
 LASTFM_USERNAME    = os.getenv("LASTFM_USERNAME", "LadoCasseta")
 
+# Spotify Web API — user-token för recently_played-ingest (mobil-lyssning).
+# client_id/secret delas med edgars spotify_api.py (SPOTIPY_*). refresh_token
+# mintas en gång via edgars spotify_auth_setup.py och läggs i edgar/.env.
+SPOTIFY_CLIENT_ID     = os.getenv("SPOTIPY_CLIENT_ID")     or os.getenv("SPOTIFY_CLIENT_ID", "")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIPY_CLIENT_SECRET") or os.getenv("SPOTIFY_CLIENT_SECRET", "")
+SPOTIFY_REFRESH_TOKEN = os.getenv("SPOTIFY_REFRESH_TOKEN", "")
+
 FAVORITE_PLAYLISTS = [
     ("Background Jazz",      "spotify:playlist:37i9dQZF1DWV7EzJMK2FUI?si=e099779019b14bb7"),
     ("Chilled Classical",    "spotify:playlist:37i9dQZF1DWUvHZA1zLcjW?si=ef77a6c2ebf14473"),
@@ -1910,7 +1917,7 @@ def play_history_data_endpoint():
     with _sqlite3.connect(db_path) as conn:
         conn.row_factory = _sqlite3.Row
         plays = [dict(r) for r in conn.execute(
-            "SELECT ts, player, artist, title, source, energy, valence, danceability, tempo, skipped "
+            "SELECT id, ts, player, artist, title, source, energy, valence, danceability, tempo, skipped "
             "FROM plays ORDER BY ts DESC LIMIT 150"
         ).fetchall()]
         profile_row = conn.execute(
@@ -1933,6 +1940,68 @@ def play_history_data_endpoint():
             bucket = min(int(r["energy"] * 10), 9)
             energy_dist[bucket] += 1
     return jsonify(plays=plays, profile=profile, top_artists=top_artists, energy_dist=energy_dist)
+
+
+@app.route('/artist_plays')
+def artist_plays_endpoint():
+    """Alla spel för en given artist (case-insensitiv exakt match på artistnamn).
+    Returnerar enskilda rader (med id för riktad radering) + en sammanfattning
+    (antal, första/senaste spel). Används av history-sidans artist-uppslagning."""
+    import sqlite3 as _sqlite3
+    artist = (request.args.get("artist") or "").strip()
+    if not artist:
+        return jsonify({"error": "artist krävs"}), 400
+    db_path = Path(__file__).parent / "play_history.db"
+    with _sqlite3.connect(db_path) as conn:
+        conn.row_factory = _sqlite3.Row
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id, ts, player, artist, title, album, source, skipped, origin "
+            "FROM plays WHERE lower(artist) = lower(?) ORDER BY ts DESC",
+            (artist,)
+        ).fetchall()]
+        summ = conn.execute(
+            "SELECT COUNT(*) n, MIN(ts) first_ts, MAX(ts) last_ts "
+            "FROM plays WHERE lower(artist) = lower(?)",
+            (artist,)
+        ).fetchone()
+    return jsonify(
+        artist=artist,
+        plays=rows,
+        count=summ[0],
+        first_ts=summ[1],
+        last_ts=summ[2],
+    )
+
+
+@app.route('/delete_plays', methods=['POST'])
+def delete_plays_endpoint():
+    """Raderar spel ur historiken. Body antingen {artist: "..."} (alla spel för
+    artisten, case-insensitivt) eller {ids: [1,2,...]} (specifika rader).
+    Returnerar {ok, deleted}. Oåterkalleligt — frontend bekräftar före anrop."""
+    import sqlite3 as _sqlite3
+    data   = request.get_json(silent=True) or {}
+    artist = (data.get("artist") or "").strip()
+    ids    = data.get("ids") or []
+    if not artist and not ids:
+        return jsonify({"error": "artist eller ids krävs"}), 400
+    db_path = Path(__file__).parent / "play_history.db"
+    try:
+        with _sqlite3.connect(db_path, timeout=5) as conn:
+            if artist:
+                cur = conn.execute(
+                    "DELETE FROM plays WHERE lower(artist) = lower(?)", (artist,))
+            else:
+                ids = [int(i) for i in ids]
+                ph = ",".join("?" * len(ids))
+                cur = conn.execute(
+                    f"DELETE FROM plays WHERE id IN ({ph})", ids)
+            deleted = cur.rowcount
+        logging.info("[history] raderade %d spel (%s)",
+                     deleted, f"artist={artist}" if artist else f"{len(ids)} id:n")
+        return jsonify({"ok": True, "deleted": deleted})
+    except Exception as e:
+        logging.warning("[history] delete_plays fel: %s", e)
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/resolved_uris')
@@ -2031,6 +2100,197 @@ def mark_origin():
     except Exception as e:
         logging.warning("[mark_origin] DB-fel: %s", e)
         return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Spotify recently_played-ingest (mobil-lyssning → play_history)
+# ---------------------------------------------------------------------------
+# Edgar "beställer" var 3:e timme (POST /spotify/ingest); bryggan hämtar
+# användarens senaste Spotify-plays via Web API och skriver in dem som plays
+# med origin='spotify_mobile'. Fångar lyssnandet utanför hemmet (~30%) som
+# annars är osynligt för LMS-historiken. Neutral smaksignal (1× via _TASTE_W).
+# played_seconds/interrupted_by_next lämnas NULL (Spotify ger ingen engagemangs-
+# data), men skipped=0 sätts: recently_played innehåller bara FAKTISKT spelade
+# spår, och skipped=0 krävs för att de ska räknas i smak-queries (alla filtrerar
+# skipped=0). skipped rör binär skip-mätning, inte completion-ratio (den läser
+# played_seconds, som förblir NULL).
+
+_spotify_user_token = {"token": None, "expires_at": 0}
+_spotify_token_lock = threading.Lock()
+
+
+def _spotify_access_token():
+    """Refresh-token-grant → access token, cachat tills strax före utgång."""
+    if not (SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET and SPOTIFY_REFRESH_TOKEN):
+        return None
+    import base64
+    with _spotify_token_lock:
+        now = time.time()
+        if _spotify_user_token["token"] and now < _spotify_user_token["expires_at"] - 60:
+            return _spotify_user_token["token"]
+        creds = base64.b64encode(
+            f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()).decode()
+        try:
+            r = _session.post(
+                "https://accounts.spotify.com/api/token",
+                headers={"Authorization": f"Basic {creds}"},
+                data={"grant_type": "refresh_token", "refresh_token": SPOTIFY_REFRESH_TOKEN},
+                timeout=10,
+            )
+            r.raise_for_status()
+            data = r.json()
+            _spotify_user_token["token"]      = data["access_token"]
+            _spotify_user_token["expires_at"] = now + data.get("expires_in", 3600)
+            return _spotify_user_token["token"]
+        except Exception as e:
+            logging.warning("[spotify-ingest] token-fel: %s", e)
+            return None
+
+
+def _played_at_to_unix(s: str):
+    """ISO8601 ('2026-06-20T14:32:11.123Z') → unix-sekunder (int) eller None."""
+    try:
+        from datetime import datetime
+        return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp())
+    except Exception:
+        return None
+
+
+def _ensure_spotify_ingest_schema(conn):
+    """Idempotent — pollern är skribent och ska aldrig falla på saknad kolumn/tabell,
+    oavsett om lms_logger.init_db hunnit migrera play_history.db."""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(plays)").fetchall()]
+    if "spotify_context_type" not in cols:
+        conn.execute("ALTER TABLE plays ADD COLUMN spotify_context_type TEXT")
+    conn.execute("CREATE TABLE IF NOT EXISTS spotify_ingest_state "
+                 "(key TEXT PRIMARY KEY, value TEXT)")
+
+
+def _already_logged_home(conn, uri, artist, title, ts, window=600):
+    """True om spåret redan loggats av lms_logger som en HEM-play nära i tid (±window s).
+    Spotty bygger på librespot → registrerar sig som Spotify Connect-enhet → hem-plays
+    dyker upp i recently_played. Utan denna spärr skulle de dubbelräknas (en gång som
+    manual/nydj av lms_logger, en gång som spotify_mobile här). Matchar på stabil URI
+    eller artist+titel; ignorerar våra egna tidigare spotify_mobile-rader."""
+    lo, hi = ts - window, ts + window
+    if uri:
+        if conn.execute(
+            "SELECT 1 FROM plays WHERE spotify_uri=? AND ts BETWEEN ? AND ? "
+            "AND (origin IS NULL OR origin != 'spotify_mobile') LIMIT 1",
+            (uri, lo, hi)).fetchone():
+            return True
+    if artist and title:
+        if conn.execute(
+            "SELECT 1 FROM plays WHERE lower(artist)=lower(?) AND lower(title)=lower(?) "
+            "AND ts BETWEEN ? AND ? AND (origin IS NULL OR origin != 'spotify_mobile') LIMIT 1",
+            (artist, title, lo, hi)).fetchone():
+            return True
+    return False
+
+
+def _spotify_feature_worker(rows):
+    """Estimerar audio-features sekventiellt för nya spotify-plays (cache + Gemini) —
+    samma väg som lms_logger använder för LMS-spår. Sekventiellt = ingen Gemini-storm."""
+    ll = _lms_logger()
+    for row_id, artist, title in rows:
+        try:
+            ll._estimate_and_store(row_id, artist, title)
+        except Exception as e:
+            logging.warning("[spotify-ingest] feature-fel %s—%s: %s", artist, title, e)
+
+
+@app.route('/spotify/ingest', methods=['POST'])
+def spotify_ingest():
+    """Hämtar Spotifys recently_played och skriver nya plays (origin='spotify_mobile').
+    Dedupe via persistent cursor (senaste played_at). Anropas av edgar var 3:e timme."""
+    if not SPOTIFY_REFRESH_TOKEN:
+        return jsonify({"error": "SPOTIFY_REFRESH_TOKEN saknas — kör spotify_auth_setup.py"}), 400
+    token = _spotify_access_token()
+    if not token:
+        return jsonify({"error": "kunde inte hämta access token"}), 502
+
+    db_path = Path(__file__).parent / "play_history.db"
+    with sqlite3.connect(db_path) as conn:
+        _ensure_spotify_ingest_schema(conn)
+        cur_row = conn.execute(
+            "SELECT value FROM spotify_ingest_state WHERE key='last_played_at_ms'"
+        ).fetchone()
+    cursor_ms = int(cur_row[0]) if cur_row and cur_row[0] else None
+
+    params = {"limit": 50}
+    if cursor_ms:
+        params["after"] = cursor_ms
+    try:
+        r = _session.get(
+            "https://api.spotify.com/v1/me/player/recently-played",
+            headers={"Authorization": f"Bearer {token}"},
+            params=params, timeout=15,
+        )
+        r.raise_for_status()
+        items = r.json().get("items", [])
+    except Exception as e:
+        logging.warning("[spotify-ingest] hämtningsfel: %s", e)
+        return jsonify({"error": str(e)}), 502
+
+    cap_count = len(items)
+    items = list(reversed(items))  # Spotify ger nyast först → kronologisk för insert
+    inserted = []
+    home_dupes = 0
+    max_ms = cursor_ms or 0
+    with sqlite3.connect(db_path) as conn:
+        _ensure_spotify_ingest_schema(conn)
+        for it in items:
+            tr = it.get("track") or {}
+            if not tr:
+                continue
+            ts = _played_at_to_unix(it.get("played_at") or "")
+            if ts is None:
+                continue
+            played_ms = ts * 1000
+            if cursor_ms and played_ms <= cursor_ms:
+                continue  # redan ingestat (belt-and-suspenders utöver after-param)
+            artist   = (tr.get("artists") or [{}])[0].get("name", "") or ""
+            title    = tr.get("name", "") or ""
+            album    = (tr.get("album") or {}).get("name", "") or ""
+            duration = int((tr.get("duration_ms") or 0) / 1000)
+            uri      = tr.get("uri") or None     # 'spotify:track:XXXX' — matchar lagrat format
+            ctx      = it.get("context") or {}
+            ctx_type = ctx.get("type") if isinstance(ctx, dict) else None
+            # Hoppa om redan loggat som hem-play (Spotty via Connect → undvik dubbelräkning).
+            # Cursorn flyttas ändå förbi spåret nedan, så det re-prövas inte.
+            if _already_logged_home(conn, uri, artist, title, ts):
+                home_dupes += 1
+                if played_ms > max_ms:
+                    max_ms = played_ms
+                continue
+            cur = conn.execute(
+                "INSERT INTO plays (ts, player, artist, title, album, duration, source, "
+                "spotify_uri, origin, skipped, spotify_context_type) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (ts, "spotify-mobil", artist, title, album, duration, "spotify",
+                 uri, "spotify_mobile", 0, ctx_type),
+            )
+            if artist and title:
+                inserted.append((cur.lastrowid, artist, title))
+            if played_ms > max_ms:
+                max_ms = played_ms
+        if max_ms and max_ms != (cursor_ms or 0):
+            conn.execute(
+                "INSERT OR REPLACE INTO spotify_ingest_state (key, value) "
+                "VALUES ('last_played_at_ms', ?)", (str(max_ms),),
+            )
+
+    hit_cap = cap_count >= 50
+    if inserted:
+        threading.Thread(target=_spotify_feature_worker, args=(inserted,),
+                         daemon=True, name="spotify-features").start()
+    if hit_cap:
+        logging.warning("[spotify-ingest] 50-taks-cap nådd — kan ha clippat plays "
+                        "(>50 sedan förra hämtning). Överväg tätare intervall.")
+    logging.info("[spotify-ingest] %d nya plays, %d hem-dubbletter hoppade (cap=%s)",
+                 len(inserted), home_dupes, hit_cap)
+    return jsonify({"ingested": len(inserted), "home_dupes": home_dupes,
+                    "hit_cap": hit_cap, "cursor_ms": max_ms})
 
 
 @app.route('/like_track')

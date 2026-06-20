@@ -91,6 +91,13 @@ def init_db():
         for col, typ in [("ctx_mood","TEXT"), ("ctx_prompt_type","TEXT"), ("ctx_energy","REAL")]:
             if col not in cols:
                 conn.execute(f"ALTER TABLE plays ADD COLUMN {col} {typ}")
+        # spotify_context_type: för plays med origin='spotify_mobile' (hämtade ur
+        # Spotifys recently_played). Spotifys context.type — 'playlist'/'artist'/
+        # 'album'/NULL. 'playlist' = för-sekvenserad (daily-mix m.m.) → exkluderas
+        # från co-listening-ankare; artist/album/NULL = aktivt val → behålls.
+        # NULL för alla icke-spotify_mobile plays.
+        if "spotify_context_type" not in cols:
+            conn.execute("ALTER TABLE plays ADD COLUMN spotify_context_type TEXT")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS pending_origins (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
