@@ -98,6 +98,10 @@ def init_db():
         # NULL för alla icke-spotify_mobile plays.
         if "spotify_context_type" not in cols:
             conn.execute("ALTER TABLE plays ADD COLUMN spotify_context_type TEXT")
+        # loved: 1 = användaren gillade spåret (via /like_track). Schema ägs här,
+        # inte i bryggans request-handler (undviker ALTER TABLE-race mellan processer).
+        if "loved" not in cols:
+            conn.execute("ALTER TABLE plays ADD COLUMN loved INTEGER DEFAULT 0")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS pending_origins (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -190,15 +194,37 @@ def _player_name(mac):
 _state = {}  # mac → {ts_start, row_id, duration}
 _state_lock = threading.Lock()
 
+# Debounce av stop-event: en skip av ett strömmat spår (Spotty) river strömmen och
+# skickar ett kort 'stop' PRECIS före nästa 'newsong'. Utan fördröjning hann _on_stop
+# märka spåret interrupted_by_next=0 ('medvetet stopp') och tömma tillståndet, så att
+# det efterföljande newsong inte kunde äga övergången → varje skip föll ur completion-
+# mätningen (just den starkaste signalen). Vi väntar därför _STOP_DEBOUNCE s och låter
+# ett inkommande newsong annullera stoppet.
+_pending_stops = {}   # mac → stop-eventets tidsstämpel (epoch, float)
+_pending_lock  = threading.Lock()
+_STOP_DEBOUNCE = 3.0  # sek att vänta på ett efterföljande newsong innan ett stop räknas som medvetet
+
 
 def _on_stop(mac):
-    """Spelare stoppades — spara faktisk speltid för pågående spår, men markera det
-    INTE som skippat (stopp = 'klar för stunden', inte avvisning)."""
-    now = int(time.time())
+    """Stop/pause-event. Kan vara ett MEDVETET stopp — eller bara strömrivningen mellan
+    två spår vid en skip. Vänta _STOP_DEBOUNCE s: kommer ett newsong för samma spelare
+    inom fönstret var det en låtövergång → _on_newsong äger spåret (interrupted_by_next=1,
+    skip mot tröskel). Kommer inget newsong → äkta stopp → interrupted_by_next=0
+    ('hann så långt', inte avvisning)."""
+    stop_ts = time.time()
+    with _pending_lock:
+        _pending_stops[mac] = stop_ts
+    time.sleep(_STOP_DEBOUNCE)
+    with _pending_lock:
+        # Annullerat av ett efterföljande newsong (eller ett nyare stop)? → inaktuellt.
+        if _pending_stops.get(mac) != stop_ts:
+            return
+        del _pending_stops[mac]
+    # Äkta stopp — finalisera pågående spår (speltid mätt VID stoppet, inte efter väntan).
     with _state_lock:
         prev = _state.pop(mac, None)
     if prev and prev.get("row_id"):
-        played = now - prev["ts_start"]
+        played = int(stop_ts) - prev["ts_start"]
         if prev.get("duration"):
             played = min(played, prev["duration"])
         try:
@@ -226,6 +252,12 @@ def _notify_alma(artist: str, title: str, source: str):
 
 def _on_newsong(mac):
     now        = int(time.time())
+    # Annullera ev. väntande stop för spelaren: detta newsong betyder att ett nyss
+    # inkommet 'stop' egentligen var en låtövergång (skip), inte ett medvetet stopp.
+    # Görs först av allt — före RPC-anropen nedan — så att _on_stop:s debounce hinner se
+    # annulleringen innan den finaliserar.
+    with _pending_lock:
+        _pending_stops.pop(mac, None)
     track      = _get_track(mac)
     player     = _player_name(mac)
 

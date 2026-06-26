@@ -81,6 +81,9 @@ FAVORITE_PLAYLISTS = [
     ("Coffee Table Jazz",    "spotify:playlist:37i9dQZF1DWVqfgj8NZEp1?si=f90718546eb4492f")
 ]
 
+# play_history.db ägs av detta repo (delas med lms_logger). Enda källan för
+# sökvägen — härled den aldrig inline med Path(__file__) på nytt.
+PLAY_DB            = Path(__file__).parent / "play_history.db"
 _SEARCH_CACHE_DB   = Path(__file__).parent / "metadata_cache.db"
 _SEARCH_TTL_TRACK  = 30 * 86400   # 30 dagar — spår ändras sällan
 _SEARCH_TTL_OTHER  = 7  * 86400   # 7 dagar  — album/artist/playlist
@@ -491,14 +494,11 @@ def _query_player_status(p):
     return {'room': p.get('name'), 'mac': mac, 'mode': 'play', 'track': track}
 
 
-_LOCK_DB = Path(__file__).parent / "play_history.db"
-
-
 def _init_lock_events():
     """Skapar lock_events-tabellen i play_history.db (delas med lms_logger).
     En rad per gång vakthunden dödar en spelare — forensik för 'varför dör saker'."""
     try:
-        with sqlite3.connect(_LOCK_DB) as conn:
+        with sqlite3.connect(PLAY_DB) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS lock_events (
                     ts              INTEGER NOT NULL,
@@ -530,7 +530,7 @@ def _init_resolved_tracks():
     upplösning (inte bara vid play, som plays.spotify_uri). Den stabila
     spotify://-URI:n är permanent, så ingen TTL — bara invalidering vid play-fel."""
     try:
-        with sqlite3.connect(_LOCK_DB) as conn:
+        with sqlite3.connect(PLAY_DB) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS resolved_tracks (
                     artist_norm TEXT NOT NULL,
@@ -555,7 +555,7 @@ def _invalidate_resolved(artist: str, title: str):
     if not (a and t):
         return
     try:
-        with sqlite3.connect(_LOCK_DB, timeout=5) as conn:
+        with sqlite3.connect(PLAY_DB, timeout=5) as conn:
             conn.execute("DELETE FROM resolved_tracks WHERE artist_norm=? AND title_norm=?", (a, t))
     except Exception as e:
         logging.warning(f"[cache] invalidate fel: {e}")
@@ -589,7 +589,7 @@ def _record_lock_event(p, r, event, froze_at, frozen_for):
         f"signal={signal} spår={pl_tracks}@{cur_index} «{artist} – {title}»"
     )
     try:
-        with sqlite3.connect(_LOCK_DB, timeout=5) as conn:
+        with sqlite3.connect(PLAY_DB, timeout=5) as conn:
             conn.execute(
                 "INSERT INTO lock_events (ts, player, mac, model, event, mode, froze_at, "
                 "frozen_for, playlist_tracks, cur_index, signalstrength, artist, title, url, source) "
@@ -1478,6 +1478,26 @@ def next_active():
     acted = _act_on_active(lambda mac: lms_json_rpc(mac, ["playlist", "index", "+1"]))
     return jsonify({'next': acted})
 
+def _resolve_spotify_artist_id(player_mac, query, timeout=35):
+    """Söker en artist via Spotty och borrar ner till dess stabila artist-item_id.
+    Returnerar (artist_id, None) vid träff, annars (None, (response, status)) som
+    anroparen kan returnera direkt. Delas av spotify_artist_top/_radio."""
+    search_res = lms_json_rpc(player_mac, ["spotty", "items", 0, 5, "item_id:1.0", f"search:{query}"], timeout=timeout)
+    if not search_res or 'result' not in search_res:
+        return None, (jsonify({"error": "Sökning misslyckades"}), 500)
+
+    loop = search_res['result'].get('loop_loop', [])
+    artist_cat = next((it for it in loop if "Artists" in it.get('name', '')), None)
+    if not artist_cat:
+        return None, (jsonify({"error": "Ingen artist-kategori hittades"}), 404)
+
+    artists = lms_json_rpc(player_mac, ["spotty", "items", 0, 1, f"item_id:{artist_cat['id']}"], timeout=timeout)
+    if not artists or not artists.get('result', {}).get('loop_loop'):
+        return None, (jsonify({"error": "Artisten hittades inte"}), 404)
+
+    return artists['result']['loop_loop'][0]['id'], None
+
+
 @app.route('/spotify_artist_top')
 def spotify_artist_top():
     """Hämtar populäraste låtarna för en artist via Spotty."""
@@ -1487,21 +1507,9 @@ def spotify_artist_top():
         return jsonify({"error": "Missing q"}), 400
 
     _spotty = 35
-
-    search_res = lms_json_rpc(player_mac, ["spotty", "items", 0, 5, "item_id:1.0", f"search:{query}"], timeout=_spotty)
-    if not search_res or 'result' not in search_res:
-        return jsonify({"error": "Sökning misslyckades"}), 500
-
-    loop = search_res['result'].get('loop_loop', [])
-    artist_cat = next((it for it in loop if "Artists" in it.get('name', '')), None)
-    if not artist_cat:
-        return jsonify({"error": "Ingen artist-kategori hittades"}), 404
-
-    artists = lms_json_rpc(player_mac, ["spotty", "items", 0, 1, f"item_id:{artist_cat['id']}"], timeout=_spotty)
-    if not artists or not artists.get('result', {}).get('loop_loop'):
-        return jsonify({"error": "Artisten hittades inte i listan"}), 404
-
-    artist_id = artists['result']['loop_loop'][0]['id']
+    artist_id, err = _resolve_spotify_artist_id(player_mac, query, _spotty)
+    if err:
+        return err
 
     # Hämta artist-menyn och hitta "Top Tracks" (eller liknande) by name
     menu_res   = lms_json_rpc(player_mac, ["spotty", "items", 0, 10, f"item_id:{artist_id}"], timeout=_spotty)
@@ -1522,26 +1530,13 @@ def spotify_artist_radio():
     """Returnerar Artist Radio-item-ID för en artist via Spotty (Spotifys egna radioalgoritm)."""
     query = request.args.get('q', '').strip()
     player_mac, _ = get_player_info(request.args.get('room'))
-
     if not query:
         return jsonify({"error": "Missing q"}), 400
 
     _spotty = 35  # Spotty-anrop kan ta lång tid när Spotify API är trög
-
-    search_res = lms_json_rpc(player_mac, ["spotty", "items", 0, 5, "item_id:1.0", f"search:{query}"], timeout=_spotty)
-    if not search_res or 'result' not in search_res:
-        return jsonify({"error": "Sökning misslyckades"}), 500
-
-    loop = search_res['result'].get('loop_loop', [])
-    artist_cat = next((it for it in loop if "Artists" in it.get('name', '')), None)
-    if not artist_cat:
-        return jsonify({"error": "Ingen artist-kategori hittades"}), 404
-
-    artists = lms_json_rpc(player_mac, ["spotty", "items", 0, 1, f"item_id:{artist_cat['id']}"], timeout=_spotty)
-    if not artists or not artists.get('result', {}).get('loop_loop'):
-        return jsonify({"error": "Artisten hittades inte"}), 404
-
-    artist_id = artists['result']['loop_loop'][0]['id']
+    artist_id, err = _resolve_spotify_artist_id(player_mac, query, _spotty)
+    if err:
+        return err
 
     root_res   = lms_json_rpc(player_mac, ["spotty", "items", 0, 20, f"item_id:{artist_id}"], timeout=_spotty)
     root_items = root_res.get('result', {}).get('loop_loop', []) if root_res else []
@@ -1911,7 +1906,7 @@ def listening_stats_endpoint():
 def play_history_data_endpoint():
     """Returnerar komplett plays-data för history-sidan."""
     import sqlite3 as _sqlite3, time as _time
-    db_path = Path(__file__).parent / "play_history.db"
+    db_path = PLAY_DB
     since_14 = int(_time.time()) - 14 * 86400
     since_30 = int(_time.time()) - 30 * 86400
     with _sqlite3.connect(db_path) as conn:
@@ -1951,7 +1946,7 @@ def artist_plays_endpoint():
     artist = (request.args.get("artist") or "").strip()
     if not artist:
         return jsonify({"error": "artist krävs"}), 400
-    db_path = Path(__file__).parent / "play_history.db"
+    db_path = PLAY_DB
     with _sqlite3.connect(db_path) as conn:
         conn.row_factory = _sqlite3.Row
         rows = [dict(r) for r in conn.execute(
@@ -1984,7 +1979,7 @@ def delete_plays_endpoint():
     ids    = data.get("ids") or []
     if not artist and not ids:
         return jsonify({"error": "artist eller ids krävs"}), 400
-    db_path = Path(__file__).parent / "play_history.db"
+    db_path = PLAY_DB
     try:
         with _sqlite3.connect(db_path, timeout=5) as conn:
             if artist:
@@ -2011,7 +2006,7 @@ def resolved_uris():
       - resolved_tracks: alla upplösningar (spotify + lms), den dedikerade cachen
       - plays.spotify_uri: spår som faktiskt spelats (historik före cachen fanns)
     Format: [{artist, title, source, id}]. 'uri' behålls som alias för bakåtkompat."""
-    db_path = Path(__file__).parent / "play_history.db"
+    db_path = PLAY_DB
     if not db_path.exists():
         return jsonify([])
     out = []
@@ -2050,7 +2045,7 @@ def cache_resolved():
     if not (artist and title and source and track_id):
         return jsonify({"error": "artist, title, source, id krävs"}), 400
     try:
-        with sqlite3.connect(_LOCK_DB, timeout=5) as conn:
+        with sqlite3.connect(PLAY_DB, timeout=5) as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO resolved_tracks "
                 "(artist_norm, title_norm, source, track_id, resolved_at) VALUES (?,?,?,?,?)",
@@ -2082,7 +2077,7 @@ def mark_origin():
     ]
     if not rows:
         return jsonify({"written": 0})
-    db_path = Path(__file__).parent / "play_history.db"
+    db_path = PLAY_DB
     try:
         with sqlite3.connect(db_path) as conn:
             try:
@@ -2209,7 +2204,7 @@ def spotify_ingest():
     if not token:
         return jsonify({"error": "kunde inte hämta access token"}), 502
 
-    db_path = Path(__file__).parent / "play_history.db"
+    db_path = PLAY_DB
     with sqlite3.connect(db_path) as conn:
         _ensure_spotify_ingest_schema(conn)
         cur_row = conn.execute(
@@ -2293,6 +2288,19 @@ def spotify_ingest():
                     "hit_cap": hit_cap, "cursor_ms": max_ms})
 
 
+def _first_playing_mac():
+    """MAC för första spelaren i mode 'play', annars None. Används av
+    like_track/skip_track för att hitta aktiv spelare när inget rum angavs."""
+    for p in get_all_players():
+        mac = p.get("playerid")
+        if not mac:
+            continue
+        res = lms_json_rpc(mac, ["status", "-", "1"])
+        if res and res.get("result", {}).get("mode") == "play":
+            return mac
+    return None
+
+
 @app.route('/like_track')
 def like_track():
     """Gillar nuvarande låt: lovar på Last.fm + flaggar loved=1 i plays-tabellen."""
@@ -2300,14 +2308,7 @@ def like_track():
 
     # Hämta spelande spelare om inget rum angavs
     if not room:
-        for p in get_all_players():
-            mac = p.get("playerid")
-            if not mac:
-                continue
-            res = lms_json_rpc(mac, ["status", "-", "1"])
-            if res and res.get("result", {}).get("mode") == "play":
-                room = mac
-                break
+        room = _first_playing_mac()
         if not room:
             return jsonify({"error": "Ingen spelare spelar just nu"}), 404
 
@@ -2337,14 +2338,11 @@ def like_track():
         logging.warning("[LastFM] Ingen session key — hoppar över Last.fm love")
 
     # Flagga loved=1 i plays-tabellen
-    db_path = Path(__file__).parent / "play_history.db"
+    db_path = PLAY_DB
     db_ok = False
     try:
         with sqlite3.connect(db_path) as conn:
-            # Migrera kolumn om den saknas
-            cols = [r[1] for r in conn.execute("PRAGMA table_info(plays)").fetchall()]
-            if "loved" not in cols:
-                conn.execute("ALTER TABLE plays ADD COLUMN loved INTEGER DEFAULT 0")
+            # 'loved'-kolumnen ägs av lms_logger.init_db() — antas finnas här.
             # Markera de senaste matchande raderna (samma artist+title, ej redan gillad)
             conn.execute(
                 "UPDATE plays SET loved=1 WHERE lower(artist)=lower(?) AND lower(title)=lower(?) AND loved=0",
@@ -2369,18 +2367,14 @@ def deck_play_pause():
 
 @app.route('/skip_track')
 def skip_track():
-    """Flaggar nuvarande låt som skippat i plays-tabellen och hoppar till nästa."""
+    """Hoppar till nästa låt. Skip-FLAGGNING sker INTE här — lms_logger äger numera
+    skip-/engagemangsdetektionen (debounce på stop + tröskel i _on_newsong). Tidigare
+    dubbelskrev denna endpoint skipped=1 oberoende av lms_logger, vilket gav motstridig
+    data (skipped=1 med interrupted_by_next=0 som föll ur completion-mätningen)."""
     room = request.args.get("room")
 
     if not room:
-        for p in get_all_players():
-            mac = p.get("playerid")
-            if not mac:
-                continue
-            res = lms_json_rpc(mac, ["status", "-", "1"])
-            if res and res.get("result", {}).get("mode") == "play":
-                room = mac
-                break
+        room = _first_playing_mac()
         if not room:
             return jsonify({"error": "Ingen spelare spelar just nu"}), 404
 
@@ -2394,26 +2388,13 @@ def skip_track():
     except Exception as e:
         return jsonify({"error": f"Kunde inte hämta låtinfo: {e}"}), 500
 
-    # Hoppa till nästa
+    # Hoppa till nästa — newsong-eventet får lms_logger att registrera skippen
+    # konsekvent (interrupted_by_next=1 + completion-ratio via tröskel). Ingen
+    # skip-skrivning här (se docstring).
     lms_json_rpc(room, ["playlist", "index", "+1"])
+    print(f"[Skip] → nästa ({artist} – {title})")
 
-    # Flagga skipped i plays-tabellen
-    db_ok = False
-    if artist and title:
-        db_path = Path(__file__).parent / "play_history.db"
-        try:
-            with sqlite3.connect(db_path) as conn:
-                conn.execute(
-                    "UPDATE plays SET skipped=1 WHERE lower(artist)=lower(?) AND lower(title)=lower(?) "
-                    "AND id=(SELECT id FROM plays WHERE lower(artist)=lower(?) AND lower(title)=lower(?) ORDER BY ts DESC LIMIT 1)",
-                    (artist, title, artist, title),
-                )
-            db_ok = True
-            print(f"[Skip] ✗ {artist} – {title}")
-        except Exception as e:
-            print(f"[Skip] DB-fel: {e}")
-
-    return jsonify({"artist": artist, "title": title, "db": db_ok})
+    return jsonify({"artist": artist, "title": title})
 
 
 def _playlist_count(mac):
