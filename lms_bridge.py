@@ -310,9 +310,14 @@ def _deferred_kick(player_mac, delay=5.0, attempts=4):
     cold-start kan behöva mer än en knuff (men hela serien ryms inom vakthundens
     60s-lås-fönster). Fel-lägen:
       - mode != 'play' → spelaren startade aldrig → ['play'].
-      - mode == 'play' men elapsed ≈ 0 → strömmen hängde vid start → ['playlist',
-        'jump',cur_index] tvingar omladdning. Avbryter så fort elapsed tickar."""
+      - mode == 'play' men elapsed ≈ 0 → strömmen hängde vid start. ESKALERANDE
+        omladdning: först en mjuk knuff (['playlist','jump',cur_index]), sedan —
+        om strömmen fortfarande är fryst — en hård omstart (stop → play). En
+        UPnP-renderare (t.ex. Audio Pro C5) tolkar ofta 'playlist jump' till SAMMA
+        index som en no-op, så den mjuka knuffen räcker inte alltid; stop→play
+        tvingar en färsk ström. Avbryter så fort elapsed tickar."""
     def _kick():
+        frozen_kicks = 0   # antal knuffar mot en fryst-vid-start-ström
         for _ in range(attempts):
             time.sleep(delay)
             res = lms_json_rpc(player_mac, ["status", "-", 1, "tags:"])
@@ -330,9 +335,16 @@ def _deferred_kick(player_mac, delay=5.0, attempts=4):
             if mode != "play":
                 logging.info(f"[kick] {player_mac} mode={mode!r}, {playlist_tracks} spår — startar (play)")
                 lms_json_rpc(player_mac, ["play"])
-            else:
-                logging.info(f"[kick] {player_mac} 'play' men fryst på elapsed≈{elapsed} — kickar (playlist jump {cur_index})")
+            elif frozen_kicks == 0:
+                logging.info(f"[kick] {player_mac} 'play' men fryst på elapsed≈{elapsed} — mjuk knuff (playlist jump {cur_index})")
                 lms_json_rpc(player_mac, ["playlist", "jump", cur_index])
+                frozen_kicks += 1
+            else:
+                logging.info(f"[kick] {player_mac} 'play' fortfarande fryst (elapsed≈{elapsed}) — hård omstart (stop→play)")
+                lms_json_rpc(player_mac, ["stop"])
+                time.sleep(0.3)
+                lms_json_rpc(player_mac, ["play"])
+                frozen_kicks += 1
     threading.Thread(target=_kick, daemon=True).start()
 
 def lms_play_stream(player_mac, play_command):
