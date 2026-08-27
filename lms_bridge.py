@@ -254,11 +254,28 @@ _last_track     = {}   # mac → nuvarande spårs identitet (url) — nytt spår
 def _cache_valid(ts, ttl):
     return time.time() - ts < ttl
 
+def _img_url(path):
+    """Brygg-proxad bild-URL för en LMS-relativ sökväg — så webbklienter slipper
+    nå LMS:ens :9000 direkt (mDNS/brandvägg gör ofta att den inte kan resolvas)."""
+    return "/imgproxy?p=" + urllib.parse.quote(path, safe="")
+
+
+def _cover_url(cover_id):
+    """Proxad omslags-URL för ett artwork_track_id. Resize-formen cover_<W>x<H>_f
+    (läge 'f', UTAN ändelse) är den enda som ger äkta omslag för ALLA album — även
+    de vars konst LMS hämtat online (där /cover.jpg 404:ar) — och skalar ner.
+    300 px fiskar upp flest omslag; 500 px får LMS att skala upp → platshållare."""
+    return _img_url(f"/music/{cover_id}/cover_300x300_f")
+
+
 def _abs_image(url):
-    """Gör relativ LMS-bild-URL absolut."""
-    if url and url.startswith('/'):
-        return f"{LMS_HTTP}{url}"
-    return url or ""
+    """Gör LMS-bild-URL klient-vänlig: relativa LMS-sökvägar proxas via bryggan,
+    absoluta (t.ex. CDN) lämnas orörda (kan hämtas direkt av klienten)."""
+    if not url:
+        return ""
+    if url.startswith('/'):
+        return _img_url(url)
+    return url
 
 def _act_on_active(command_fn):
     """Kör command_fn(mac) på alla spelare som för tillfället spelar. Returnerar berörda rum."""
@@ -484,11 +501,19 @@ def _format_entry(item, search_type):
     if search_type == "album" and ' by ' in name:
         title, subtitle = name.split(' by ', 1)
 
+    # Spotty lindar Spotify-CDN-bilder i LMS imageproxy
+    # (/imageproxy/https%3A%2F%2Fi.scdn.co%2F.../image.png). Plocka ut den direkta
+    # CDN-URL:en — den kan hämtas direkt av vilken klient som helst (publik HTTPS).
+    raw_img = item.get('image', '')
+    m = re.search(r'/imageproxy/([^/]+)/image', raw_img)
+    image_cdn = urllib.parse.unquote(m.group(1)) if m else (raw_img if raw_img.startswith('http') else '')
+
     return {
         "name": title.strip(),
         "subtitle": subtitle.strip(),
         "uri": uri,
-        "art": _abs_image(item.get('image', '')),
+        "art": _abs_image(raw_img),
+        "image_cdn": image_cdn,
     }
 
 def _query_player_status(p):
@@ -903,7 +928,7 @@ def search_library():
                     'title':  item.get('album'),
                     'artist': item.get('artist'),
                     'year':   item.get('year'),
-                    'art':    f"{LMS_HTTP}/music/{cover_id}/cover.jpg"
+                    'art':    _cover_url(cover_id)
                               if cover_id else None,
                 })
 
@@ -965,7 +990,7 @@ def get_artist_albums():
                 'title':  item.get('album'),
                 'artist': item.get('artist'),
                 'year':   item.get('year'),
-                'art':    f"{LMS_HTTP}/music/{cover_id}/cover.jpg"
+                'art':    _cover_url(cover_id)
                           if cover_id else None,
             })
 
@@ -1093,7 +1118,27 @@ def get_album_art():
     player_mac, _ = get_player_info(request.args.get('room'))
     if not player_mac:
         return "/static/icon.png"
-    return f"{LMS_HTTP}/music/current/cover.jpg?player={player_mac}&time={int(time.time())}"
+    return _img_url(f"/music/current/cover.jpg?player={player_mac}&time={int(time.time())}")
+
+@app.route('/imgproxy')
+def imgproxy():
+    """Proxar en LMS-bild (sökväg måste börja med /) så webbklienter aldrig behöver
+    nå LMS:ens :9000 direkt. Begränsad till LMS_HTTP → ingen öppen proxy."""
+    from flask import Response
+    p = urllib.parse.unquote(request.args.get('p', ''))
+    if not p.startswith('/'):
+        return "", 400
+    try:
+        r = _session.get(f"{LMS_HTTP}{p}", timeout=6)
+    except Exception:
+        return "", 502
+    if not r.ok:
+        return "", 404
+    return Response(
+        r.content,
+        content_type=r.headers.get('Content-Type', 'image/jpeg'),
+        headers={'Cache-Control': 'public, max-age=86400'},
+    )
 
 @app.route('/status')
 def get_status():
@@ -1108,16 +1153,19 @@ def get_status():
 
 @app.route('/get_random_albums')
 def get_random_albums():
-    res = lms_json_rpc(None, ["albums", 0, 10, "sort:random", "tags:albj"])
+    res = lms_json_rpc(None, ["albums", 0, 40, "sort:random", "tags:albj"])
     albums = []
     if res and 'result' in res:
         for item in res['result'].get('albums_loop', []):
-            cover_id = item.get('artwork_track_id') or item.get('id')
+            # BARA artwork_track_id ger äkta omslag; album-id/imageproxy ger en fast
+            # platshållare för ALLA. Saknas artwork_track_id → inget omslag (glyf).
+            cover_id = item.get('artwork_track_id')
             albums.append({
-                'id':     item.get('id'),
-                'title':  item.get('album'),
-                'artist': item.get('artist'),
-                'art':    f"{LMS_HTTP}/music/{cover_id}/cover.jpg"
+                'id':       item.get('id'),
+                'title':    item.get('album'),
+                'artist':   item.get('artist'),
+                'cover_id': cover_id or "",
+                'art':      _cover_url(cover_id) if cover_id else ""
             })
     return jsonify(albums)
 
@@ -1130,11 +1178,15 @@ def get_daily_mixes():
         if not any(x in title for x in ["Mix", "Radar", "Discovery", "daylist"]):
             continue
         raw_id = item.get('params', {}).get('item_id') or item.get('id', '0.0')
+        raw_img = item.get('icon') or item.get('image', '')
+        m = re.search(r'/imageproxy/([^/]+)/image', raw_img)
+        image_cdn = urllib.parse.unquote(m.group(1)) if m else (raw_img if raw_img.startswith('http') else '')
         mixes.append({
             'id':          raw_id.split('.')[-1],
             'title':       title,
             'description': parts[1] if len(parts) > 1 else "Din personliga mix",
-            'art':         _abs_image(item.get('icon') or item.get('image', '')),
+            'art':         _abs_image(raw_img),
+            'image_cdn':   image_cdn,
         })
     return jsonify(mixes)
 
@@ -1276,13 +1328,16 @@ def get_radio_favorites():
             fav_id = item.get('id')
             if not fav_id:
                 continue
-            art = _abs_image(item.get('image') or item.get('icon', '')) \
-                  or "https://via.placeholder.com/300x300/111/444?text=Radio"
+            raw_img = item.get('image') or item.get('icon', '')
+            m = re.search(r'/imageproxy/([^/]+)/image', raw_img)
+            image_cdn = urllib.parse.unquote(m.group(1)) if m else (raw_img if raw_img.startswith('http') else '')
+            art = _abs_image(raw_img) or "https://via.placeholder.com/300x300/111/444?text=Radio"
             stations.append({
-                'id':   fav_id,
-                'name': item.get('name', 'Okänd kanal'),
-                'url':  fav_id,
-                'art':  art
+                'id':        fav_id,
+                'name':      item.get('name', 'Okänd kanal'),
+                'url':       fav_id,
+                'art':       art,
+                'image_cdn': image_cdn,
             })
         stations = sorted(stations, key=lambda x: x['name'].lower())
 
