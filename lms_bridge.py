@@ -106,9 +106,14 @@ def _init_search_cache():
             CREATE TABLE IF NOT EXISTS mix_labels (
                 mix_id    INTEGER PRIMARY KEY,
                 label     TEXT    NOT NULL,
+                summary   TEXT,
                 cached_at INTEGER NOT NULL
             )
         """)
+        # Migration: lägg till summary-kolumn om tabellen redan fanns utan den.
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(mix_labels)").fetchall()]
+        if "summary" not in cols:
+            conn.execute("ALTER TABLE mix_labels ADD COLUMN summary TEXT")
 
 
 _init_search_cache()
@@ -154,17 +159,49 @@ def _get_mix_label(artists_text: str) -> str | None:
         return None
 
 
+def _get_mix_summary(artists_text: str) -> str | None:
+    """Frågar Gemini om en kort, lockande beskrivning (~6–12 ord) av mixen — för
+    ytor med mer plats än knappen (t.ex. dashboard-kort)."""
+    client = _get_gemini()
+    if not client:
+        return None
+    prompt = (
+        f"Artister: {artists_text}\n\n"
+        "Skriv en MYCKET kort, lockande beskrivning på svenska (3–6 ord, ingen "
+        "fullständig mening) av den här spellistan. Nämn genre/era/stämning och "
+        "gärna en tongivande artist. T.ex. 'Mörk EBM-klubb med Nitzer Ebb', "
+        "'Soulig 70-tal', 'Drömsk synthpop och shoegaze'. Bara orden, inga citattecken."
+    )
+    try:
+        resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        s = resp.text.strip()
+        # Gemini ger ibland flera förslag på egna rader — ta bara första raden.
+        s = s.split("\n")[0].strip().strip('"').strip().rstrip(".")
+        # Säkerhetsnät: håll det kort (max 7 ord).
+        words = s.split()
+        if len(words) > 7:
+            s = " ".join(words[:7])
+        return s or None
+    except Exception as e:
+        logging.warning(f"[mix_labels] Gemini-summary-fel: {e}")
+        return None
+
+
 def _refresh_mix_labels():
     """Genererar AI-labels för Daily Mix 1–6 och cachar i DB. Körs i bakgrund."""
     now = int(time.time())
     stale_ids = set()
 
     with sqlite3.connect(_SEARCH_CACHE_DB) as conn:
-        rows = {r[0]: r[1] for r in conn.execute(
-            "SELECT mix_id, cached_at FROM mix_labels"
+        rows = {r[0]: (r[1], r[2]) for r in conn.execute(
+            "SELECT mix_id, cached_at, summary FROM mix_labels"
         ).fetchall()}
     for mix_id in range(6):
-        if mix_id not in rows or (now - rows[mix_id]) > _MIX_LABEL_TTL:
+        cached = rows.get(mix_id)
+        # Regenerera om saknas, utgången, saknar summering, ELLER om den cachade
+        # summeringen är för lång (>7 ord) — så gamla långa texter kortas vid omstart.
+        too_long = bool(cached and cached[1] and len(cached[1].split()) > 7)
+        if not cached or (now - cached[0]) > _MIX_LABEL_TTL or not cached[1] or too_long:
             stale_ids.add(mix_id)
 
     if not stale_ids:
@@ -180,14 +217,15 @@ def _refresh_mix_labels():
         if mix_id not in stale_ids:
             continue
         artists_text = parts[1] if len(parts) > 1 else title
-        label = _get_mix_label(artists_text)
-        if label:
+        label   = _get_mix_label(artists_text)
+        summary = _get_mix_summary(artists_text)
+        if label or summary:
             with _db_lock, sqlite3.connect(_SEARCH_CACHE_DB) as conn:
                 conn.execute(
-                    "INSERT OR REPLACE INTO mix_labels (mix_id, label, cached_at) VALUES (?,?,?)",
-                    (mix_id, label, int(time.time()))
+                    "INSERT OR REPLACE INTO mix_labels (mix_id, label, summary, cached_at) VALUES (?,?,?,?)",
+                    (mix_id, label or "", summary, int(time.time()))
                 )
-            logging.info(f"[mix_labels] {title} → \"{label}\"")
+            logging.info(f"[mix_labels] {title} → \"{label}\" / \"{summary}\"")
 
 
 def _mix_label_loop():
@@ -333,6 +371,13 @@ def _deferred_kick(player_mac, delay=5.0, attempts=4):
         UPnP-renderare (t.ex. Audio Pro C5) tolkar ofta 'playlist jump' till SAMMA
         index som en no-op, så den mjuka knuffen räcker inte alltid; stop→play
         tvingar en färsk ström. Avbryter så fort elapsed tickar."""
+    # C5 (UPnP) har en LÅNGSAM kallstart: mode='play' men elapsed ligger kvar på 0
+    # i ~10-12 s medan renderaren buffrar FLAC-strömmen — utan att vara hängd. En
+    # kick i det fönstret river ner strömmen (bridge-N → N+1) och startar om, om och
+    # om igen. Ge C5 en lång startfrist så vi bara ingriper vid genuin hängning
+    # (vakthunden fångar det värsta vid 60 s ändå).
+    if player_mac == C5_MAC:
+        delay, attempts = 15.0, 2
     def _kick():
         frozen_kicks = 0   # antal knuffar mot en fryst-vid-start-ström
         for _ in range(attempts):
@@ -1171,6 +1216,15 @@ def get_random_albums():
 
 @app.route('/get_daily_mixes')
 def get_daily_mixes():
+    # AI-summeringar (samma som knappens label men längre) cachade i mix_labels.
+    try:
+        with sqlite3.connect(_SEARCH_CACHE_DB) as conn:
+            ai_summaries = {r[0]: r[1] for r in conn.execute(
+                "SELECT mix_id, summary FROM mix_labels"
+            ).fetchall()}
+    except Exception:
+        ai_summaries = {}
+
     mixes = []
     for item in _fetch_daily_mixes_raw():
         parts = item.get('text', '').split('\n')
@@ -1181,10 +1235,16 @@ def get_daily_mixes():
         raw_img = item.get('icon') or item.get('image', '')
         m = re.search(r'/imageproxy/([^/]+)/image', raw_img)
         image_cdn = urllib.parse.unquote(m.group(1)) if m else (raw_img if raw_img.startswith('http') else '')
+        mid = raw_id.split('.')[-1]
+        try:
+            ai_summary = ai_summaries.get(int(mid))
+        except (TypeError, ValueError):
+            ai_summary = None
         mixes.append({
-            'id':          raw_id.split('.')[-1],
+            'id':          mid,
             'title':       title,
             'description': parts[1] if len(parts) > 1 else "Din personliga mix",
+            'ai_summary':  ai_summary or None,
             'art':         _abs_image(raw_img),
             'image_cdn':   image_cdn,
         })
@@ -1397,7 +1457,11 @@ def transfer_playback():
 
     lms_json_rpc(to_mac, ["playlist", "play", current_url])
     time.sleep(0.8)
-    lms_json_rpc(to_mac, ["time", cur_time])
+    # C5 (UPnP) klarar INTE att söka in i en färsk Spotty-ström → den fastnar i en
+    # om-seek-loop (t.ex. 0:36→0:39→0:36). Starta spåret från början på C5; söker
+    # bara på spelare som faktiskt hanterar det.
+    if to_mac != C5_MAC:
+        lms_json_rpc(to_mac, ["time", cur_time])
 
     for track in playlist[cur_index + 1:]:
         url = track.get('url', '')
@@ -1405,6 +1469,10 @@ def transfer_playback():
             lms_json_rpc(to_mac, ["playlist", "add", url])
 
     lms_json_rpc(from_mac, ["pause", 1])
+    # C5 kan behöva knuffas igång — samma eskalerande stop→play som övriga
+    # uppspelningsvägar, annars hänger öppnaren tills vakthunden dödar den.
+    if to_mac == C5_MAC:
+        _deferred_kick(to_mac)
     return "OK"
 
 @app.route('/c5_discover')
