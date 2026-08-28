@@ -282,9 +282,12 @@ _ACTIVE_PLAYERS_CACHE_TTL = 5
 _LOCK_KILL_SECONDS  = int(os.getenv("BRIDGE_LOCK_KILL_SECONDS", "60"))      # lås-tröskel
 _IDLE_FLUSH_SECONDS = int(os.getenv("BRIDGE_IDLE_FLUSH_SECONDS", "3600"))   # paus/stopp-tröskel
 _WATCHDOG_POLL      = int(os.getenv("BRIDGE_WATCHDOG_POLL", "10"))          # kollintervall
+_C5_RECOVER_STOP_PLAY = int(os.getenv("BRIDGE_C5_RECOVER_STOP_PLAY", "22"))  # C5: stop→play vid Ns låst
+_C5_RECOVER_SKIP      = int(os.getenv("BRIDGE_C5_RECOVER_SKIP", "40"))       # C5: hoppa spår vid Ns låst
 _last_active_ts = {}   # mac → senaste tidpunkt spelaren faktiskt gjorde framsteg
 _last_elapsed   = {}   # mac → senast sedda elapsed-tid (för att upptäcka frysning)
 _last_track     = {}   # mac → nuvarande spårs identitet (url) — nytt spår = färsk frist
+_c5_recover     = {}   # mac → antal räddningsförsök vakthunden gjort mot en låst C5
 
 
 # --- HJÄLPFUNKTIONER ---
@@ -359,6 +362,49 @@ def lms_json_rpc(player_id, command_args, timeout=3):
         print(f"[ERROR] LMS: {e}")
         return None
 
+def _c5_coldstart_watch(mac):
+    """C5 (UPnP+Spotty) stammar ofta i kallstart: elapsed BACKAR upprepade gånger
+    (strömmen startar om sig själv). Snabb-pollar (2,5 s) i ~45 s och gör en ren
+    stop→play när 2 sådana restarter setts — det bryter mönstret långt snabbare än
+    vakthundens 10 s-poll. Rör ALDRIG en ström som ökar stabilt (då spelar/buffrar
+    den bara); en ren frysning lämnas till vakthundens tålmodiga räddning (22 s)."""
+    prev = None
+    restarts = 0
+    recoveries = 0
+    stable_since = None
+    deadline = time.time() + 45
+    while time.time() < deadline:
+        time.sleep(2.5)
+        res = lms_json_rpc(mac, ["status", "-", 1, "tags:"])
+        if not res:
+            continue
+        r = res.get("result", {})
+        if r.get("playlist_tracks", 0) <= 0 or r.get("mode") != "play":
+            return                                  # tomt/pausat/stoppat → sluta bevaka
+        elapsed = r.get("time") or 0
+        if prev is not None:
+            if elapsed > prev + 0.5:                # ökar = spelar
+                stable_since = stable_since or time.time()
+                if time.time() - stable_since >= 5:
+                    return                          # stabil uppspelning i 5 s — klart
+            elif prev - elapsed > 1.0:              # backade = stream-restart
+                restarts += 1
+                stable_since = None
+                logging.info(f"[c5-coldstart] {mac} stream-restart #{restarts} ({prev:.0f}→{elapsed:.0f})")
+                if restarts >= 2 and recoveries < 2:
+                    logging.info(f"[c5-coldstart] {mac} stammar — stabiliserar (stop→play) [{recoveries+1}/2]")
+                    lms_json_rpc(mac, ["stop"])
+                    time.sleep(0.3)
+                    lms_json_rpc(mac, ["play"])
+                    restarts = 0
+                    recoveries += 1
+                    prev = None
+                    stable_since = None
+                    time.sleep(3)                   # låt den etablera efter vår restart
+                    continue
+        prev = elapsed
+
+
 def _deferred_kick(player_mac, delay=5.0, attempts=4):
     """Efter ett play-kommando: säkerställ att uppspelningen faktiskt kom igång,
     annars knuffa. Gör upp till `attempts` försök med `delay`s mellanrum — Spotty
@@ -371,13 +417,13 @@ def _deferred_kick(player_mac, delay=5.0, attempts=4):
         UPnP-renderare (t.ex. Audio Pro C5) tolkar ofta 'playlist jump' till SAMMA
         index som en no-op, så den mjuka knuffen räcker inte alltid; stop→play
         tvingar en färsk ström. Avbryter så fort elapsed tickar."""
-    # C5 (UPnP) har en LÅNGSAM kallstart: mode='play' men elapsed ligger kvar på 0
-    # i ~10-12 s medan renderaren buffrar FLAC-strömmen — utan att vara hängd. En
-    # kick i det fönstret river ner strömmen (bridge-N → N+1) och startar om, om och
-    # om igen. Ge C5 en lång startfrist så vi bara ingriper vid genuin hängning
-    # (vakthunden fångar det värsta vid 60 s ändå).
+    # C5 (UPnP+Spotty) har en skakig kallstart och sköts av en dedikerad snabb
+    # kallstartsvakt i stället för den generiska kicken (10 s-upplösning är för
+    # trubbig för en ~3 s-stamning; och en kick i buffringsfönstret startar bara
+    # om strömmen). Genuina frysningar tas av vakthundens tålmodiga C5-räddning.
     if player_mac == C5_MAC:
-        delay, attempts = 15.0, 2
+        threading.Thread(target=_c5_coldstart_watch, args=(player_mac,), daemon=True).start()
+        return
     def _kick():
         frozen_kicks = 0   # antal knuffar mot en fryst-vid-start-ström
         for _ in range(attempts):
@@ -707,16 +753,20 @@ def _watchdog_tick():
 
         prev_elapsed = _last_elapsed.get(mac)
         _last_elapsed[mac] = elapsed
-        # Framsteg = spelar OCH elapsed har rört sig sedan förra koll. Vid första
-        # sikte (prev_elapsed is None) litar vi på mode för att inte agera i onödan.
-        making_progress = mode == 'play' and (prev_elapsed is None or elapsed != prev_elapsed)
         # Nytt spår laddat → färsk frist. Annars dödas en kallstartande ström direkt
         # om spelaren stått idle/pausad länge innan (stale _last_active_ts-klocka).
         prev_track = _last_track.get(mac)
         _last_track[mac] = track_key
         track_changed = track_key is not None and track_key != prev_track
 
-        if making_progress or track_changed:
+        # Framsteg = spelar OCH elapsed har ÖKAT (en backning/frysning = inte framsteg).
+        making_progress = mode == 'play' and (prev_elapsed is None or elapsed > prev_elapsed)
+
+        if making_progress:
+            _last_active_ts[mac] = now
+            _c5_recover.pop(mac, None)   # äkta framsteg → nollställ räddningsräknaren
+            continue
+        if track_changed:
             _last_active_ts[mac] = now
             continue
 
@@ -733,6 +783,29 @@ def _watchdog_tick():
         # Lås (rapporterar 'play' men står still) är en trasig ström → döda snabbt.
         # Paus/stopp kan vara medvetet → ge en timme innan kön rensas.
         is_lock = mode == 'play'
+
+        # C5-RÄDDNING (UPnP): väck bara en MID-STREAM-frysning (elapsed > 0 → strömmen
+        # spelade och hängde sig). En KALLSTART står på elapsed≈0 medan MP3-strömmen
+        # buffrar (~15–30 s); ett stop→play där startar bara om buffringen och ger
+        # "hoppar till 0 om och om igen". Kallstart lämnas därför till 60 s-backstopen
+        # nedan — MP3 latchar långt innan dess. (Före MP3-codec-fixen var C5 lossless
+        # FLAC och underrannade även mid-stream; då behövdes den aggressiva räddningen
+        # även vid elapsed=0. Nollställs vid äkta framsteg ovan.)
+        if is_lock and mac == C5_MAC and elapsed >= 2.0 and frozen_for >= _C5_RECOVER_STOP_PLAY:
+            n = _c5_recover.get(mac, 0)
+            if n == 0:
+                logging.info(f"[watchdog] {name} C5 låst {int(frozen_for)}s — väcker (stop→play)")
+                lms_json_rpc(mac, ["stop"])
+                time.sleep(0.3)
+                lms_json_rpc(mac, ["play"])
+                _c5_recover[mac] = 1
+                continue
+            if n == 1 and frozen_for >= _C5_RECOVER_SKIP:
+                logging.info(f"[watchdog] {name} C5 fortsatt låst {int(frozen_for)}s — hoppar till nästa spår")
+                lms_json_rpc(mac, ["playlist", "index", "+1"])
+                _c5_recover[mac] = 2
+                continue
+
         threshold = _LOCK_KILL_SECONDS if is_lock else _IDLE_FLUSH_SECONDS
 
         if frozen_for >= threshold:
@@ -751,6 +824,7 @@ def _watchdog_tick():
             _last_active_ts[mac] = now   # nollställ klockan efter åtgärd
             _last_elapsed.pop(mac, None)
             _last_track.pop(mac, None)
+            _c5_recover.pop(mac, None)
 
     # Glöm spelare som försvunnit (avstängda) så dictarna inte växer obegränsat.
     for mac in list(_last_active_ts.keys()):
@@ -758,6 +832,7 @@ def _watchdog_tick():
             _last_active_ts.pop(mac, None)
             _last_elapsed.pop(mac, None)
             _last_track.pop(mac, None)
+            _c5_recover.pop(mac, None)
 
 
 def _watchdog_loop():
