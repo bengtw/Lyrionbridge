@@ -439,6 +439,9 @@ def _deferred_kick(player_mac, delay=5.0, attempts=4):
                 return
             if mode == "play" and elapsed > 1.0:
                 return  # spelar och tickar — klart
+            if mode == "pause":
+                return  # MEDVETEN paus (t.ex. användaren) → knuffa inte igång igen.
+                        # Bara 'stop' (startade aldrig) eller fryst 'play' ska knuffas.
             cur_index = r.get("playlist_cur_index", 0)
             if mode != "play":
                 logging.info(f"[kick] {player_mac} mode={mode!r}, {playlist_tracks} spår — startar (play)")
