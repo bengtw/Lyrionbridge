@@ -582,10 +582,16 @@ def _format_track(item, stable_uri=None):
     }
 
 
+# Ord som matchar nästan vad som helst — "the" i "Berlin The Metro" matchade
+# "The Blue Nile" och släppte igenom korsprat.
+_SEARCH_STOPWORDS = {"the", "and", "feat", "featuring", "with", "for", "you", "your", "från", "och", "med"}
+
+
 def _search_matches_query(query: str, loop: list) -> bool:
     """True om minst en träff (namn eller undertext) delar ett ord (>2 tecken) med
     frågan. Kategorirader (Artists/Albums/…) räknas inte som träffar."""
-    words = {w for w in query.lower().split() if len(w) > 2}
+    words = {w.strip(".,'\"()-") for w in query.lower().split()} - _SEARCH_STOPWORDS
+    words = {w for w in words if len(w) > 2}
     audio = [it for it in loop
              if str(it.get('isaudio', '')) == '1' or it.get('type') in ('audio', 'track')]
     if not words or not audio:
