@@ -274,12 +274,15 @@ _ACTIVE_PLAYERS_CACHE_TTL = 5
 # still på elapsed, så enbart mode-koll räcker inte. Vakthunden återupplivar INTE
 # (ingen kick mitt i en låt — det är lika irriterande som hängningen); den dödar
 # bara det som inte kommer framåt. Två trösklar beroende på läge:
-#   - LÅS (mode 'play' men fryst): trasig ström → stop + rensa kö efter ~1 min.
+#   - LÅS (mode 'play' men fryst): först hopp till nästa spår efter ~30 s (max 2 hopp,
+#     en hängd Spotty-start ska inte kosta hela kön), sedan stop + rensa kö efter ~1 min.
 #   - PAUS/STOPP (mode != 'play'): kan vara medveten paus → vänta 1 h innan kö
 #     rensas, så inget spontant återupptas men en avsiktlig paus hinner återupptas.
 # Play-tid-kicken i _deferred_kick hanterar separat strömmar som aldrig startade.
 # Allt konfigurerbart via .env.
 _LOCK_KILL_SECONDS  = int(os.getenv("BRIDGE_LOCK_KILL_SECONDS", "60"))      # lås-tröskel
+_LOCK_SKIP_SECONDS  = int(os.getenv("BRIDGE_LOCK_SKIP_SECONDS", "30"))      # lås: hoppa till nästa spår efter Ns
+_LOCK_SKIP_MAX      = int(os.getenv("BRIDGE_LOCK_SKIP_MAX", "2"))           # max hopp innan stop + rensa
 _IDLE_FLUSH_SECONDS = int(os.getenv("BRIDGE_IDLE_FLUSH_SECONDS", "3600"))   # paus/stopp-tröskel
 _WATCHDOG_POLL      = int(os.getenv("BRIDGE_WATCHDOG_POLL", "10"))          # kollintervall
 _C5_RECOVER_STOP_PLAY = int(os.getenv("BRIDGE_C5_RECOVER_STOP_PLAY", "22"))  # C5: stop→play vid Ns låst
@@ -288,6 +291,7 @@ _last_active_ts = {}   # mac → senaste tidpunkt spelaren faktiskt gjorde frams
 _last_elapsed   = {}   # mac → senast sedda elapsed-tid (för att upptäcka frysning)
 _last_track     = {}   # mac → nuvarande spårs identitet (url) — nytt spår = färsk frist
 _c5_recover     = {}   # mac → antal räddningsförsök vakthunden gjort mot en låst C5
+_skip_recover   = {}   # mac → antal spårhopp vakthunden gjort mot ett lås (nollställs vid framsteg)
 
 
 # --- HJÄLPFUNKTIONER ---
@@ -768,6 +772,7 @@ def _watchdog_tick():
         if making_progress:
             _last_active_ts[mac] = now
             _c5_recover.pop(mac, None)   # äkta framsteg → nollställ räddningsräknaren
+            _skip_recover.pop(mac, None)
             continue
         if track_changed:
             _last_active_ts[mac] = now
@@ -809,6 +814,28 @@ def _watchdog_tick():
                 _c5_recover[mac] = 2
                 continue
 
+        # HOPP-RÄDDNING (alla spelare utom C5, som har sin egen väg ovan): ett lås
+        # med fler spår i kön är oftast EN hängd strömstart — typiskt Spotty-helpern
+        # som aldrig levererar nästa spår (verkligt fall 2026-09-15: Goldfrapp spelade
+        # klart, spotty-x86_64 för spår 2 hängde tyst i 75 s, vakthunden kastade 17
+        # köade spår). Hoppa över det hängda spåret i stället; först när hoppen inte
+        # ger framsteg faller vi till stop + rensa nedan. Hoppet byter url → track_changed
+        # → färsk frist, så nästa spår får egen _LOCK_SKIP_SECONDS-frist.
+        cur_index = r.get('playlist_cur_index') or 0
+        has_next  = cur_index < playlist_tracks - 1
+        if is_lock and mac != C5_MAC and has_next and frozen_for >= _LOCK_SKIP_SECONDS:
+            n = _skip_recover.get(mac, 0)
+            if n < _LOCK_SKIP_MAX:
+                logging.info(
+                    f"[watchdog] {name} låst {int(frozen_for)}s på spår {cur_index + 1}/{playlist_tracks} "
+                    f"— hoppar till nästa (försök {n + 1}/{_LOCK_SKIP_MAX})"
+                )
+                _record_lock_event(p, r, event="skip", froze_at=elapsed, frozen_for=int(frozen_for))
+                lms_json_rpc(mac, ["playlist", "index", "+1"])
+                _skip_recover[mac] = n + 1
+                _last_active_ts[mac] = now
+                continue
+
         threshold = _LOCK_KILL_SECONDS if is_lock else _IDLE_FLUSH_SECONDS
 
         if frozen_for >= threshold:
@@ -828,6 +855,7 @@ def _watchdog_tick():
             _last_elapsed.pop(mac, None)
             _last_track.pop(mac, None)
             _c5_recover.pop(mac, None)
+            _skip_recover.pop(mac, None)
 
     # Glöm spelare som försvunnit (avstängda) så dictarna inte växer obegränsat.
     for mac in list(_last_active_ts.keys()):
@@ -836,6 +864,7 @@ def _watchdog_tick():
             _last_elapsed.pop(mac, None)
             _last_track.pop(mac, None)
             _c5_recover.pop(mac, None)
+            _skip_recover.pop(mac, None)
 
 
 def _watchdog_loop():
