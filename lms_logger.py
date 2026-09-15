@@ -31,6 +31,9 @@ load_dotenv(_env)
 
 LMS_HOST     = os.getenv("LMS_HOST", "10.0.1.132")
 LMS_CLI_PORT = int(os.getenv("LMS_CLI_PORT", "9090"))
+# Hur länge en pending_origin gäller. Var 2 h — för kort: en Daily Mix (~50 spår)
+# eller en 34-spårs DJ-lista är längre, och svansen föll tyst till 'manual' (3× vikt).
+_PENDING_WINDOW = int(os.getenv("LMS_PENDING_ORIGIN_WINDOW", str(5 * 3600)))
 LMS_PORT     = int(os.getenv("LMS_PORT", "9000"))
 LMS_JSON_URL = f"http://{LMS_HOST}:{LMS_PORT}/jsonrpc.js"
 DB_PATH      = Path(__file__).parent / "play_history.db"
@@ -291,7 +294,7 @@ def _on_newsong(mac):
                 SELECT origin, context FROM pending_origins
                 WHERE artist_lower=? AND title_lower=? AND ts > ?
                 ORDER BY ts DESC LIMIT 1
-            """, (track["artist"].lower(), track["title"].lower(), now - 7200)).fetchone()
+            """, (track["artist"].lower(), track["title"].lower(), now - _PENDING_WINDOW)).fetchone()
             if row:
                 origin = row["origin"]
                 if row["context"]:
@@ -302,7 +305,7 @@ def _on_newsong(mac):
                         ctx_energy = ctx.get("energy")
                     except Exception:
                         pass
-                conn.execute("DELETE FROM pending_origins WHERE ts < ?", (now - 7200,))
+                conn.execute("DELETE FROM pending_origins WHERE ts < ?", (now - _PENDING_WINDOW,))
 
         cur    = conn.execute(
             "INSERT INTO plays (ts, player, artist, title, album, duration, source, spotify_uri, "

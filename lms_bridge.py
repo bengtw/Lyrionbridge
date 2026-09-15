@@ -1055,6 +1055,7 @@ def play_url():
     # --- SPELLISTOR: Shuffle PÅ, vänta på att Spotty laddar kön ---
     elif "spotify:playlist:" in clean_url:
         res = lms_play_playlist(player_mac, clean_url)
+        _mark_queue_origin(player_mac, "spotify_playlist")
 
     # --- ENKLA LÅTAR: Spotty-sökresultat eller stabil spotify:// URI ---
     elif clean_url.startswith("1.0_") or "spotify:track:" in clean_url or clean_url.startswith("spotify://track:"):
@@ -1210,6 +1211,7 @@ def play_daily():
     if not player_mac:
         return "Error", 404
     lms_play_stream(player_mac, ["spotty", "playlist", "play", f"item_id:playlists.{idx}"])
+    _mark_queue_origin(player_mac, "daily_mix")   # Spotify valde spåren — inte 'manual'
     return f"Playing Daily Mix {idx}"
 
 @app.route('/play_random_album')
@@ -2333,6 +2335,65 @@ def cache_resolved():
         return jsonify({"error": str(e)}), 500
 
 
+def _write_pending_origins(rows: list[tuple]) -> int:
+    """rows = (artist_lower, title_lower, origin, ts, ctx_json). Tål logger utan context-kolumn."""
+    if not rows:
+        return 0
+    with sqlite3.connect(PLAY_DB) as conn:
+        try:
+            conn.executemany(
+                "INSERT INTO pending_origins (artist_lower, title_lower, origin, ts, context) "
+                "VALUES (?,?,?,?,?)", rows,
+            )
+        except sqlite3.OperationalError:
+            conn.executemany(
+                "INSERT INTO pending_origins (artist_lower, title_lower, origin, ts) "
+                "VALUES (?,?,?,?)", [r[:4] for r in rows],
+            )
+    return len(rows)
+
+
+def _mark_queue_origin(player_mac: str, origin: str, delays=(4, 20)):
+    """Taggar det som ligger i spelarens kö med ett ursprung — i bakgrunden, efter
+    att en spellista/mix laddats. Läser kön två gånger (Spotty fyller på progressivt)
+    och unionar. Används för Daily Mix, Spotify-spellistor och Artist Radio, som
+    annars loggas som 'manual' (= aktivt val, 3× smakvikt) fast Spotify valde spåren.
+    Läsa kön slår Spotty-browse: samma väg för alla laddningar och inget korsprat."""
+    def _run():
+        seen: set[tuple] = set()
+        for i, d in enumerate(delays):
+            time.sleep(d if i == 0 else d - delays[i - 1])
+            res = lms_json_rpc(player_mac, ["status", 0, 200, "tags:al"], timeout=15)
+            loop = ((res or {}).get('result') or {}).get('playlist_loop', [])
+            now = int(time.time())
+            rows = []
+            for t in loop:
+                a, ti = (t.get('artist') or '').strip().lower(), (t.get('title') or '').strip().lower()
+                if a and ti and (a, ti) not in seen:
+                    seen.add((a, ti))
+                    rows.append((a, ti, origin, now, None))
+            try:
+                n = _write_pending_origins(rows)
+                if n:
+                    logging.info(f"[mark_queue_origin] {origin}: {n} spår taggade (läsning {i + 1})")
+            except Exception as e:
+                logging.warning(f"[mark_queue_origin] DB-fel: {e}")
+    threading.Thread(target=_run, daemon=True, name=f"mark-{origin}").start()
+
+
+@app.route('/mark_queue_origin', methods=['POST'])
+def mark_queue_origin():
+    """Edgar-anrop efter en playlist-laddning den gjort själv (t.ex. Artist Radio via
+    direkt LMS-kommando): {room, origin}."""
+    data = request.get_json(force=True, silent=True) or {}
+    origin = (data.get("origin") or "").strip()
+    player_mac, _ = get_player_info(data.get("room"))
+    if not origin or not player_mac:
+        return jsonify({"error": "origin och room krävs"}), 400
+    _mark_queue_origin(player_mac, origin)
+    return jsonify({"ok": True})
+
+
 @app.route('/mark_origin', methods=['POST'])
 def mark_origin():
     """Skriver köade spår till pending_origins-tabellen så lms_logger kan märka
@@ -2353,21 +2414,8 @@ def mark_origin():
     ]
     if not rows:
         return jsonify({"written": 0})
-    db_path = PLAY_DB
     try:
-        with sqlite3.connect(db_path) as conn:
-            try:
-                conn.executemany(
-                    "INSERT INTO pending_origins (artist_lower, title_lower, origin, ts, context) "
-                    "VALUES (?,?,?,?,?)", rows,
-                )
-            except sqlite3.OperationalError:
-                # context-kolumnen finns inte än (lms_logger ej migrerad) → skriv utan
-                conn.executemany(
-                    "INSERT INTO pending_origins (artist_lower, title_lower, origin, ts) "
-                    "VALUES (?,?,?,?)", [r[:4] for r in rows],
-                )
-        return jsonify({"written": len(rows)})
+        return jsonify({"written": _write_pending_origins(rows)})
     except Exception as e:
         logging.warning("[mark_origin] DB-fel: %s", e)
         return jsonify({"error": str(e)}), 500
