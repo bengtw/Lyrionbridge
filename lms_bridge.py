@@ -119,6 +119,11 @@ def _init_search_cache():
 _init_search_cache()
 
 _db_lock       = threading.Lock()   # serialiserar skrivningar mot metadata_cache.db
+# Spotty-browse (`spotty items`) är sessionsbundet per spelare med positionella
+# item_id — samtidiga sökningar + URI-drillningar ger KORSPRAT: svaret på "ABBA
+# Dancing Queen" blev The Blue Niles albumspår (68 sådana poster i sökcachen,
+# skur 2026-09-15 när 11 prefetch-listor löstes i följd). Max 2 samtidiga.
+_spotty_sem    = threading.Semaphore(int(os.getenv("BRIDGE_SPOTTY_CONCURRENCY", "2")))
 _gemini_client = None
 _gemini_lock   = threading.Lock()
 
@@ -577,11 +582,27 @@ def _format_track(item, stable_uri=None):
     }
 
 
+def _search_matches_query(query: str, loop: list) -> bool:
+    """True om minst en träff (namn eller undertext) delar ett ord (>2 tecken) med
+    frågan. Kategorirader (Artists/Albums/…) räknas inte som träffar."""
+    words = {w for w in query.lower().split() if len(w) > 2}
+    audio = [it for it in loop
+             if str(it.get('isaudio', '')) == '1' or it.get('type') in ('audio', 'track')]
+    if not words or not audio:
+        return True   # inget att bedöma — "inga spårträffar" är ett äkta svar, inte korsprat
+    for it in audio:
+        text = f"{it.get('name', '')} {it.get('line2', '')} {it.get('subtitle', '')} {it.get('artist', '')}".lower()
+        if any(w in text for w in words):
+            return True
+    return False
+
+
 def _get_stable_spotify_uri(item_id, player_mac):
     """Borrar ner till leaf-noden och returnerar stabil spotify://track:XXXX-URI.
     Försöker upp till 2 gånger med 8 sekunders timeout."""
     for _ in range(2):
-        sub = lms_json_rpc(player_mac, ["spotty", "items", 0, 1, f"item_id:{item_id}"], timeout=8)
+        with _spotty_sem:
+            sub = lms_json_rpc(player_mac, ["spotty", "items", 0, 1, f"item_id:{item_id}"], timeout=8)
         if sub and 'result' in sub:
             loop = sub['result'].get('loop_loop', [])
             if loop:
@@ -1631,13 +1652,20 @@ def spotify_search():
 
     loop = []
     for _attempt in range(3):
-        initial = lms_json_rpc(player_mac, [
-            "spotty", "items", 0, 50,
-            "item_id:1.0",
-            f"search:{query}",
-        ], timeout=10)
+        with _spotty_sem:
+            initial = lms_json_rpc(player_mac, [
+                "spotty", "items", 0, 50,
+                "item_id:1.0",
+                f"search:{query}",
+            ], timeout=10)
         if initial and 'result' in initial:
             loop = initial['result'].get('loop_loop', [])
+            # Korsprat-vakt: ett svar där INGEN träff delar ett ord med frågan är
+            # inte ett sökresultat utan någon annan meny (typiskt ett albums spår-
+            # lista). Kasta och försök igen — och cacha aldrig ett sådant svar.
+            if loop and not _search_matches_query(query, loop):
+                logging.warning(f"[spotify_search] korsprat för {query!r}: {loop[0].get('name','')[:40]!r} — försöker igen")
+                loop = []
             if loop:
                 break
         if _attempt < 2:
