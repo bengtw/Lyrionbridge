@@ -23,7 +23,6 @@ A Python bridge for [Lyrion Music Server](https://lyrion.org) that acts as the m
 - **Spotify caching** — search results cached on disk (30 days for tracks, 7 days for albums/artists/playlists)
 - **Daily Mix labels** — AI-generated 1–2 word Swedish style labels per Daily Mix (e.g. "EBM-klubb", "80-talssynth"), refreshed every 6 hours
 - **Button prompts** — physical remotes with no screen can trigger Edgar prompts via `/button_prompt`
-- **PWA** — mobile-optimized web app served directly by the bridge
 
 ## Requirements
 
@@ -66,7 +65,8 @@ python3 lms_logger.py
 # or: sudo systemctl enable --now lms_logger
 ```
 
-Open `http://<server-ip>:5000` in a browser or add it to your home screen as a PWA.
+The bridge is an API only — it serves no web UI. The music interface lives in Edgar
+(`http://<edgar-host>:5015/dashboard`); the bridge's own root just prints a pointer there.
 
 ## API Endpoints
 

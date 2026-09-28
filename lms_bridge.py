@@ -994,15 +994,22 @@ def _get_lastfm_taste_profile():
     return profile
 
 
-# --- PWA SERVERING ---
+# --- ROT + ENSTAKA FIL ---
+# Multilyrion-PWA:n (static/index.html + app.js) togs bort sep 2026 — dashboarden
+# på muzak:5015/dashboard gör samma sak bättre, och alla data-endpoints den använde
+# används ändå av dashboarden. Bryggan är sedan dess ett rent API.
 
 @app.route('/')
 def serve_index():
-    return send_from_directory('static', 'index.html')
+    return ("LMS-bryggan — API, inget UI här.\n"
+            "Musikgränssnittet finns på http://muzak.local:5015/dashboard\n", 200,
+            {"Content-Type": "text/plain; charset=utf-8"})
 
-@app.route('/<path:path>')
-def serve_static(path):
-    return send_from_directory('static', path)
+@app.route('/edgar-ca.crt')
+def serve_ca():
+    """Rot-certifikatet för handpåläggning på nya enheter. Hade tidigare bara en
+    URL via den generella static-routen, som försvann med PWA:n."""
+    return send_from_directory('static', 'edgar-ca.crt')
 
 
 # --- API ENDPOINTS ---
@@ -1293,13 +1300,6 @@ def next_track():
         return "Error", 404
     lms_json_rpc(player_mac, ["playlist", "index", "+1"])
     return "OK"
-
-@app.route('/art')
-def get_album_art():
-    player_mac, _ = get_player_info(request.args.get('room'))
-    if not player_mac:
-        return "/static/icon.png"
-    return _img_url(f"/music/current/cover.jpg?player={player_mac}&time={int(time.time())}")
 
 @app.route('/imgproxy')
 def imgproxy():
