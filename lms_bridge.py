@@ -763,6 +763,16 @@ def _record_lock_event(p, r, event, froze_at, frozen_for):
         logging.warning(f"[watchdog] kunde inte logga lock_event: {e}")
 
 
+def _num(v, default=0.0) -> float:
+    """LMS JSON-RPC returnerar ibland numeriska fält som strängar ("3", "12.5") —
+    beroende på spelartyp. Jämförelser mellan str och tal kraschade vakthunden
+    var 10:e s från 1 sep 2026 tills detta infördes."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def _watchdog_tick():
     """Ett varv: döda spelare som inte kommer framåt. Lås (mode 'play' men fryst)
     rensas efter _LOCK_KILL_SECONDS, paus/stopp efter _IDLE_FLUSH_SECONDS. Ingen
@@ -779,8 +789,8 @@ def _watchdog_tick():
             continue
         r = res['result']
         mode = r.get('mode')
-        playlist_tracks = r.get('playlist_tracks', 0)
-        elapsed = r.get('time', 0)
+        playlist_tracks = int(_num(r.get('playlist_tracks')))
+        elapsed = _num(r.get('time'))
         name = p.get('name', mac)
         loop = r.get('playlist_loop', [])
         track_key = (loop[0].get('url') or loop[0].get('id')) if loop else None
@@ -848,7 +858,7 @@ def _watchdog_tick():
         # köade spår). Hoppa över det hängda spåret i stället; först när hoppen inte
         # ger framsteg faller vi till stop + rensa nedan. Hoppet byter url → track_changed
         # → färsk frist, så nästa spår får egen _LOCK_SKIP_SECONDS-frist.
-        cur_index = r.get('playlist_cur_index') or 0
+        cur_index = int(_num(r.get('playlist_cur_index')))
         has_next  = cur_index < playlist_tracks - 1
         if is_lock and mac != C5_MAC and has_next and frozen_for >= _LOCK_SKIP_SECONDS:
             n = _skip_recover.get(mac, 0)

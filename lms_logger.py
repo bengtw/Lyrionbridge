@@ -11,6 +11,8 @@ Eller som systemd-service (se lms_logger.service).
 """
 
 import json
+import re
+import unicodedata
 import os
 import socket
 import sqlite3
@@ -34,6 +36,25 @@ LMS_CLI_PORT = int(os.getenv("LMS_CLI_PORT", "9090"))
 # Hur länge en pending_origin gäller. Var 2 h — för kort: en Daily Mix (~50 spår)
 # eller en 34-spårs DJ-lista är längre, och svansen föll tyst till 'manual' (3× vikt).
 _PENDING_WINDOW = int(os.getenv("LMS_PENDING_ORIGIN_WINDOW", str(5 * 3600)))
+
+
+def _origin_key(artist: str, title: str) -> tuple[str, str]:
+    """Löst jämförbar nyckel för ursprungsmatchning. pending_origins skrivs med
+    GEMINIS stavning, men LMS rapporterar Spotifys: "Bangles" ↔ "The Bangles",
+    "Word Up!" ↔ "Word Up", "Fun for Me" ↔ "Fun for Me - Radio Edit". Exakt
+    jämförelse tappade ~11% av DJ-spåren till 'manual' (mätt 15–28 sep 2026) —
+    och manual väger 3× i smakprofilen."""
+    def fold(x: str) -> str:
+        x = unicodedata.normalize("NFKD", (x or "").lower())
+        return "".join(ch for ch in x if not unicodedata.combining(ch))
+    a = fold(artist)
+    a = re.split(r"\s+(?:feat\.?|ft\.?|featuring)\s+|,", a)[0]
+    a = re.sub(r"^the\s+", "", a.strip())
+    t = fold(title)
+    t = re.sub(r"\s*[\(\[].*?[\)\]]", "", t)       # (Remastered), [feat. X]
+    t = re.sub(r"\s+-\s+.*$", "", t)                  # - Radio Edit, - 2024 Digital Master
+    clean = lambda x: re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", "", x.replace("&", " and "))).strip()
+    return clean(a), clean(t)
 LMS_PORT     = int(os.getenv("LMS_PORT", "9000"))
 LMS_JSON_URL = f"http://{LMS_HOST}:{LMS_PORT}/jsonrpc.js"
 DB_PATH      = Path(__file__).parent / "play_history.db"
@@ -295,6 +316,16 @@ def _on_newsong(mac):
                 WHERE artist_lower=? AND title_lower=? AND ts > ?
                 ORDER BY ts DESC LIMIT 1
             """, (track["artist"].lower(), track["title"].lower(), now - _PENDING_WINDOW)).fetchone()
+            if not row:
+                # Stavningen skiljer sig (se _origin_key) — jämför normaliserat.
+                want = _origin_key(track["artist"], track["title"])
+                for cand in conn.execute("""
+                    SELECT origin, context, artist_lower, title_lower FROM pending_origins
+                    WHERE ts > ? ORDER BY ts DESC
+                """, (now - _PENDING_WINDOW,)):
+                    if _origin_key(cand["artist_lower"], cand["title_lower"]) == want:
+                        row = cand
+                        break
             if row:
                 origin = row["origin"]
                 if row["context"]:
