@@ -2679,6 +2679,64 @@ def like_track():
     return jsonify({"artist": artist, "title": title, "lastfm": lfm_ok, "db": db_ok})
 
 
+@app.route('/love_track', methods=['POST'])
+def love_track():
+    """Gillar ett spår som INTE spelas just nu: Last.fm love + loved=1 i plays.
+    Body: {artist, title} eller {artist, titles: [...]}. Utan titel gillas
+    artistens senast spelade spår. Samma effekt som /like_track, men riktad mot
+    historiken — används av history-vyns 'antecknad artist → gillad'."""
+    import sqlite3 as _sqlite3
+    data   = request.get_json(silent=True) or {}
+    artist = (data.get("artist") or "").strip()
+    titles = [t.strip() for t in (data.get("titles") or []) if (t or "").strip()]
+    if data.get("title"):
+        titles.append(str(data["title"]).strip())
+    if not artist:
+        return jsonify({"error": "artist krävs"}), 400
+
+    db_path = PLAY_DB
+    if not titles:
+        # Ingen titel angiven → ta artistens senaste spel ur historiken.
+        try:
+            with _sqlite3.connect(db_path, timeout=5) as conn:
+                row = conn.execute(
+                    "SELECT title FROM plays WHERE lower(artist) = lower(?) "
+                    "ORDER BY ts DESC LIMIT 1", (artist,)
+                ).fetchone()
+            if row and row[0]:
+                titles = [row[0]]
+        except Exception as e:
+            logging.warning("[Love] kunde inte slå upp senaste spår: %s", e)
+    if not titles:
+        return jsonify({"error": f"Hittade inga spel för {artist}"}), 404
+
+    # Last.fm love per titel (tyst hoppad om sessionsnyckel saknas)
+    lastfm = []
+    for t in titles:
+        ok = False
+        if LASTFM_SESSION_KEY:
+            ok = _lastfm_post("track.love", artist=artist, track=t) is not None
+            logging.info("[LastFM] %s love: %s – %s", "♥" if ok else "✗", artist, t)
+        lastfm.append({"title": t, "ok": ok})
+
+    # loved=1 på matchande rader (samma villkor som /like_track)
+    loved_rows = 0
+    try:
+        with _sqlite3.connect(db_path, timeout=5) as conn:
+            for t in titles:
+                cur = conn.execute(
+                    "UPDATE plays SET loved=1 WHERE lower(artist)=lower(?) "
+                    "AND lower(title)=lower(?) AND loved=0", (artist, t))
+                loved_rows += cur.rowcount
+    except Exception as e:
+        logging.warning("[Love] DB-fel: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+    logging.info("[Love] %s: %d rader loved=1 (%d titlar)", artist, loved_rows, len(titles))
+    return jsonify({"ok": True, "artist": artist, "titles": titles,
+                    "loved_rows": loved_rows, "lastfm": lastfm})
+
+
 @app.route('/deck_play_pause')
 def deck_play_pause():
     """Skickar play/pause-toggle till kontoret."""

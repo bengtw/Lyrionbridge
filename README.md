@@ -113,6 +113,8 @@ The bridge is an API only — it serves no web UI. The music interface lives in 
 | `GET /skipped_tracks?limit=N&days=N` | Tracks skipped most often |
 | `GET /listening_stats?days=N` | Play count, source breakdown, top artists |
 | `GET /play_history_data` | Full history page payload (plays, profile, top artists, energy distribution) |
+| `GET /like_track?room=` | Loves the *currently playing* track: Last.fm love + `plays.loved=1` |
+| `POST /love_track` | Loves a track that is **not** playing. Body `{artist, title}` or `{artist, titles: [...]}`; without a title the artist's most recent play is used. Same effect as `/like_track` but aimed at the history — used by Edgar's "noted artist → liked" |
 
 All playback endpoints accept an optional `?room=<name or MAC>` parameter to target a specific player.
 
