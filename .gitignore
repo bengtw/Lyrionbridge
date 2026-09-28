@@ -12,3 +12,5 @@ __pycache__/
 # Hemligheter / övrigt
 .env
 .DS_Store
+*.db-wal
+*.db-shm
