@@ -194,6 +194,7 @@ def _get_track(mac):
         "title":       t.get("title") or t.get("name", ""),
         "album":       t.get("album", ""),
         "duration":    int(r.get("duration") or 0),
+        "position":    float(r.get("time") or 0),   # spelposition — för att fortsätta en rad
         "source":      source,
         "spotify_uri": spotify_uri,
     }
@@ -215,8 +216,35 @@ def _player_name(mac):
 # Spårloggning och skip-detektion
 # ---------------------------------------------------------------------------
 
-_state = {}  # mac → {ts_start, row_id, duration}
+_state = {}  # mac → {ts_start, row_id, duration, key}
 _state_lock = threading.Lock()
+
+# Samma spelning, flera newsong (sep 2026). LMS skickar newsong även när SAMMA spår
+# startar om: Spotty skickar ofta två i rad vid strömstart, bryggans streaming-kick gör
+# upp till 4 'playlist jump' (5 s isär), och en Spotty-ström som återupptas efter paus
+# startas om. Varje sådant newsong blev en ny rad och föregående räknades som skip —
+# 73 av 478 skippar jul–sep var falska, och de bildade falska skipp-serier.
+# Nu: newsong för samma spår som pågår (eller nyss stoppades) och som inte spelats klart
+# fortsätter DEN raden. Ett spår som spelats klart och startar igen (repeat) blir ny rad.
+_SAME_PLAY_MAX  = 0.9        # andel spelad under vilken samma spår räknas som samma spelning
+_REPEAT_GRACE   = 30         # newsong för samma spår så här nära förra starten = alltid samma
+                             # spelning (återstart vid 199/204 s följs av Spotty-dubbletten)
+_RESUME_WINDOW  = 2 * 3600   # hur länge en pausad rad kan återupptas (vakthunden rensar efter 1 h)
+_last_stopped   = {}         # mac → {row_id, key, duration, played, ts} — senast stoppade raden
+
+
+def _track_key(t):
+    return ((t.get("artist") or "").strip().lower(), (t.get("title") or "").strip().lower())
+
+
+def _unfinished(played, duration):
+    return not duration or played < duration * _SAME_PLAY_MAX
+
+
+def _resumable(played, duration):
+    """En PAUSAD rad kan återupptas om spåret inte nådde slutet — 90 %-gränsen gäller inte
+    här: en paus vid 199/204 s som återupptas är fortfarande samma spelning."""
+    return not duration or played < duration - 2
 
 # Debounce av stop-event: en skip av ett strömmat spår (Spotty) river strömmen och
 # skickar ett kort 'stop' PRECIS före nästa 'newsong'. Utan fördröjning hann _on_stop
@@ -260,6 +288,10 @@ def _on_stop(mac):
                              (int(played), prev["row_id"]))
         except Exception as e:
             print(f"[LMS Logger] _on_stop played_seconds-fel: {e}")
+        with _state_lock:
+            _last_stopped[mac] = {"row_id": prev["row_id"], "key": prev.get("key"),
+                                  "duration": prev.get("duration"), "played": int(played),
+                                  "ts": stop_ts}
 
 
 def _notify_alma(artist: str, title: str, source: str):
@@ -274,6 +306,41 @@ def _notify_alma(artist: str, title: str, source: str):
         pass
 
 
+def _continue_same_play(mac, track, now):
+    """True om detta newsong är samma spelning som redan har en rad — då skapas ingen ny.
+    Två fall: (1) spåret pågår redan (dubbel-newsong, streaming-kick), (2) spåret stoppades
+    nyss utan att spelas klart och startar igen (återupptagen paus). Starttiden sätts från
+    LMS-positionen, så speltiden blir rätt både när strömmen börjar om från 0 (kick) och
+    när den fortsätter där den var (paus)."""
+    key = _track_key(track)
+    if not key[1]:
+        return False
+    ts_start = now - int(track.get("position") or 0)
+    with _state_lock:
+        prev = _state.get(mac)
+        if prev and prev.get("key") == key and (
+                _unfinished(now - prev["ts_start"], prev["duration"])
+                or now - prev.get("started_at", 0) < _REPEAT_GRACE):
+            prev["ts_start"] = ts_start
+            prev["started_at"] = now
+            print(f"[LOG] {track['artist']} — {track['title']}: samma spelning (dubbelt newsong/kick)")
+            return True
+        stopped = _last_stopped.get(mac)
+        if not (prev is None and stopped and stopped["key"] == key
+                and now - stopped["ts"] < _RESUME_WINDOW
+                and _resumable(stopped["played"], stopped["duration"])):
+            return False
+        _last_stopped.pop(mac)
+        _state[mac] = {"ts_start": ts_start, "row_id": stopped["row_id"],
+                       "duration": stopped["duration"], "key": key, "started_at": now}
+    # Öppna raden igen — den avslutas av nästa newsong eller stopp som vanligt.
+    with _db() as conn:
+        conn.execute("UPDATE plays SET played_seconds=NULL, interrupted_by_next=NULL "
+                     "WHERE id=?", (stopped["row_id"],))
+    print(f"[LOG] {track['artist']} — {track['title']}: återupptagen efter paus (rad {stopped['row_id']})")
+    return True
+
+
 def _on_newsong(mac):
     now        = int(time.time())
     # Annullera ev. väntande stop för spelaren: detta newsong betyder att ett nyss
@@ -284,6 +351,9 @@ def _on_newsong(mac):
         _pending_stops.pop(mac, None)
     track      = _get_track(mac)
     player     = _player_name(mac)
+
+    if track and _continue_same_play(mac, track, now):
+        return
 
     with _db() as conn:
         # Markera föregående spår som skippad bara om det avbröts mitt i pågående spel
@@ -348,7 +418,9 @@ def _on_newsong(mac):
         row_id = cur.lastrowid
 
     with _state_lock:
-        _state[mac] = {"ts_start": now, "row_id": row_id, "duration": track["duration"]}
+        _state[mac] = {"ts_start": now, "row_id": row_id, "duration": track["duration"],
+                       "key": _track_key(track), "started_at": now}
+        _last_stopped.pop(mac, None)
 
     src_tag    = "spotify" if track["source"] == "spotify" else "local "
     origin_tag = f" [{origin}]" if origin else ""
