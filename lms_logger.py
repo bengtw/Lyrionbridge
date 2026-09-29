@@ -380,7 +380,19 @@ def _on_newsong(mac):
         # ligger kvar som NULL.)
         origin = "manual"
         ctx_mood = ctx_ptype = ctx_energy = None
-        if track["artist"] and track["title"]:
+        # Repris av en GAMMAL kö (sep 2026): LMS startar om sista spåret, går runt till
+        # början av kön eller återupptar den när spelaren slås på. Fields of Gold loggades
+        # 5 ggr på 4 h som 'nydj' — pending_origins matchar i 5 h och förbrukas aldrig.
+        # Samma spår på samma spelare inom fönstret, där förra spelningen kom från DJ/tips/
+        # mix, är inget nytt val → 'replay' (neutral: ingen smak, ingen DJ-statistik).
+        replay = track["artist"] and track["title"] and conn.execute("""
+            SELECT 1 FROM plays WHERE player=? AND lower(artist)=? AND lower(title)=? AND ts > ?
+              AND origin IS NOT NULL AND origin NOT IN ('manual', 'replay') LIMIT 1
+        """, (player, track["artist"].lower(), track["title"].lower(),
+              now - _PENDING_WINDOW)).fetchone()
+        if replay:
+            origin = "replay"
+        elif track["artist"] and track["title"]:
             row = conn.execute("""
                 SELECT origin, context FROM pending_origins
                 WHERE artist_lower=? AND title_lower=? AND ts > ?
