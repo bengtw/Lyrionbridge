@@ -58,6 +58,8 @@ LMS_URL      = f"{LMS_HTTP}/jsonrpc.js"
 EDGAR_URL    = os.getenv("EDGAR_URL", "http://127.0.0.1:5015")
 C5_IP        = os.getenv("C5_IP",  "10.0.1.125")
 C5_MAC       = os.getenv("C5_MAC", "bb:bb:7a:f8:33:39")
+C5_FREEZE_S      = 7.5   # elapsed 0 så här länge efter play-kommandot → stop→play (~7,5 s)
+C5_FREEZE_SKIP_S = 5.0   # … och fortfarande 0 så här länge efter det → hoppa till nästa (~13 s)
 PLAYLIST_DIR = os.getenv("LMS_PLAYLIST_DIR", "/var/lib/squeezeboxserver/playlists")
 DEBUG              = os.getenv("BRIDGE_DEBUG", "").lower() == "true"
 LASTFM_API_KEY     = os.getenv("LAST_FM_API_KEY") or os.getenv("LASTFM_API_KEY", "9ed2b1dfa5c3f0ece0a30ec8e69b4742")
@@ -376,11 +378,20 @@ def _c5_coldstart_watch(mac):
     (strömmen startar om sig själv). Snabb-pollar (2,5 s) i ~45 s och gör en ren
     stop→play när 2 sådana restarter setts — det bryter mönstret långt snabbare än
     vakthundens 10 s-poll. Rör ALDRIG en ström som ökar stabilt (då spelar/buffrar
-    den bara); en ren frysning lämnas till vakthundens tålmodiga räddning (22 s)."""
+    den bara).
+
+    STILLASTÅENDE vid start (okt 2026): LMS buffrar fullt men C5 skickar aldrig
+    "Started" — elapsed står på 0. Lämnades förr åt vakthunden (stop→play efter
+    30 s, hopp efter 40 s), men användaren hoppade själv långt innan; i loggen
+    syntes knappt något. Nu: 0 i C5_FREEZE_S → stop→play; fortfarande 0 efter
+    C5_FREEZE_SKIP_S till → hoppa till nästa spår (det som faktiskt fungerar).
+    En normal C5-kallstart tar 1–3 s."""
     prev = None
     restarts = 0
     recoveries = 0
     stable_since = None
+    frozen_since = time.time()                      # räknas från play-kommandot, inte första pollen
+    freeze_stage = 0                                # 0 = inget gjort, 1 = stop→play, 2 = hoppat
     deadline = time.time() + 45
     while time.time() < deadline:
         time.sleep(2.5)
@@ -388,9 +399,28 @@ def _c5_coldstart_watch(mac):
         if not res:
             continue
         r = res.get("result", {})
-        if r.get("playlist_tracks", 0) <= 0 or r.get("mode") != "play":
+        if _num(r.get("playlist_tracks", 0)) <= 0 or r.get("mode") != "play":
             return                                  # tomt/pausat/stoppat → sluta bevaka
-        elapsed = r.get("time") or 0
+        elapsed = _num(r.get("time") or 0)
+        if elapsed <= 0.5:
+            frozen_since = frozen_since or time.time()
+            frozen = time.time() - frozen_since
+            if freeze_stage == 0 and frozen >= C5_FREEZE_S:
+                logging.info(f"[c5-coldstart] {mac} står still på 0 i {frozen:.0f} s — stop→play")
+                lms_json_rpc(mac, ["stop"])
+                time.sleep(0.3)
+                lms_json_rpc(mac, ["play"])
+                freeze_stage, frozen_since, prev = 1, time.time(), None
+                continue
+            if freeze_stage == 1 and frozen >= C5_FREEZE_SKIP_S:
+                logging.info(f"[c5-coldstart] {mac} fortfarande still efter stop→play — hoppar till nästa spår")
+                lms_json_rpc(mac, ["playlist", "index", "+1"])
+                freeze_stage, frozen_since, prev = 2, time.time(), None
+                continue
+            if freeze_stage == 2 and frozen >= C5_FREEZE_SKIP_S:
+                return                              # lämna åt vakthunden
+        else:
+            frozen_since = None
         if prev is not None:
             if elapsed > prev + 0.5:                # ökar = spelar
                 stable_since = stable_since or time.time()
