@@ -144,6 +144,13 @@ def _get_gemini():
     return _gemini_client
 
 
+def _mix_model() -> str:
+    """Modell för mix-etiketter och -summeringar. 3.1 Flash Lite sedan 7 okt 2026 (var
+    hårdkodad 2.5). Inga sampling-/thinking-parametrar skickas, så anropen tål även
+    nyare modeller. Läses vid varje anrop så .env/systemd-ändringar slår igenom."""
+    return os.environ.get("LMS_LABEL_MODEL", "gemini-3.1-flash-lite")
+
+
 def _get_mix_label(artists_text: str) -> str | None:
     """Frågar Gemini om 1-2 ord som sammanfattar stämningen hos dessa artister."""
     client = _get_gemini()
@@ -158,7 +165,7 @@ def _get_mix_label(artists_text: str) -> str | None:
         "Bara orden, inget annat."
     )
     try:
-        resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        resp = client.models.generate_content(model=_mix_model(), contents=prompt)
         label = resp.text.strip().strip('.')
         return label if label else None
     except Exception as e:
@@ -180,7 +187,7 @@ def _get_mix_summary(artists_text: str) -> str | None:
         "'Soulig 70-tal', 'Drömsk synthpop och shoegaze'. Bara orden, inga citattecken."
     )
     try:
-        resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        resp = client.models.generate_content(model=_mix_model(), contents=prompt)
         s = resp.text.strip()
         # Gemini ger ibland flera förslag på egna rader — ta bara första raden.
         s = s.split("\n")[0].strip().strip('"').strip().rstrip(".")

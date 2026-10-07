@@ -35,6 +35,10 @@ LMS_HOST     = os.getenv("LMS_HOST", "10.0.1.132")
 LMS_CLI_PORT = int(os.getenv("LMS_CLI_PORT", "9090"))
 # Hur länge en pending_origin gäller. Var 2 h — för kort: en Daily Mix (~50 spår)
 # eller en 34-spårs DJ-lista är längre, och svansen föll tyst till 'manual' (3× vikt).
+# Audio-features (energy/valence …) är modellens UPPSKATTNINGAR på dess egen skala.
+# Byt inte modell mitt i historiken: DJ-pipen (feature_filter, energiprofil, sekvensering)
+# jämför värdena. Vid byte: sätt variabeln OCH kör --backfill över alla spår.
+_FEATURES_MODEL = os.getenv("LMS_FEATURES_MODEL", "gemini-2.5-flash")
 _PENDING_WINDOW = int(os.getenv("LMS_PENDING_ORIGIN_WINDOW", str(5 * 3600)))
 
 
@@ -504,7 +508,7 @@ def _estimate_features_batch(tracks: list[tuple[str, str]]) -> dict:
         f"Tracks:\n{track_list}"
     )
     try:
-        resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        resp = client.models.generate_content(model=_FEATURES_MODEL, contents=prompt)
         text = resp.text.strip()
         if text.startswith("```"):
             text = text.split("\n", 1)[1].rsplit("```", 1)[0]
