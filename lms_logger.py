@@ -360,8 +360,14 @@ def _on_newsong(mac):
         # (inte om spelaren stoppades och en ny session startades senare)
         with _state_lock:
             prev = _state.get(mac)
+        repeat = False
         if prev:
             elapsed = now - prev["ts_start"]
+            # Upprepning (okt 2026): samma spår på samma spelare igen direkt efter att det
+            # spelats klart = repeat-läge, inte ett nytt val. Two Minute Warning loggades
+            # 12 ggr i rad som 'manual' (väger 3×) när telefonen stod på repeat.
+            repeat = bool(track and prev.get("key") == _track_key(track)
+                          and prev["duration"] and elapsed >= prev["duration"] * 0.9)
             # Spara faktisk speltid (kapad till spårlängden) — engagemangsgradient.
             played = min(elapsed, prev["duration"]) if prev["duration"] else elapsed
             skipped = 1 if (prev["duration"] > 20 and elapsed < prev["duration"] * SKIP_THRESHOLD) else 0
@@ -390,7 +396,10 @@ def _on_newsong(mac):
               AND origin IS NOT NULL AND origin NOT IN ('manual', 'replay') LIMIT 1
         """, (player, track["artist"].lower(), track["title"].lower(),
               now - _PENDING_WINDOW)).fetchone()
-        if replay:
+        if repeat:
+            origin = "repeat"          # neutral som 'replay': ingen smak, ingen DJ-statistik
+            print(f"[LOG] {track['artist']} — {track['title']}: upprepning (repeat) — märks 'repeat'")
+        elif replay:
             origin = "replay"
         elif track["artist"] and track["title"]:
             row = conn.execute("""
