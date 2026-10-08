@@ -58,8 +58,14 @@ LMS_URL      = f"{LMS_HTTP}/jsonrpc.js"
 EDGAR_URL    = os.getenv("EDGAR_URL", "http://127.0.0.1:5015")
 C5_IP        = os.getenv("C5_IP",  "10.0.1.125")
 C5_MAC       = os.getenv("C5_MAC", "bb:bb:7a:f8:33:39")
-C5_FREEZE_S      = 7.5   # elapsed 0 så här länge efter play-kommandot → stop→play (~7,5 s)
-C5_FREEZE_SKIP_S = 5.0   # … och fortfarande 0 så här länge efter det → hoppa till nästa (~13 s)
+# C5-start (omgjord 8 okt 2026). All C5-styrning bygger på C5:ans EGEN UPnP-status
+# (c5_transport_state) och tid sedan den senast spelade — aldrig på LMS:ens elapsed,
+# som står på 0 i 6–9 s under en normal start och kan ticka vidare när C5 tystnat.
+C5_COLD_AFTER_S   = 30 * 60   # tyst så här länge → nästa start räknas som kallstart
+C5_WAKE_MAX_S     = 6.0       # väckning före play: vänta högst så här länge på svar
+C5_START_RETRY_S  = 20.0      # inte PLAYING så här länge efter play → stop→play
+C5_START_SKIP_S   = 35.0      # … fortfarande inte → hoppa till nästa spår
+C5_DESYNC_S       = 20.0      # LMS spelar men C5 STOPPED så här länge → logga (skuggläge)
 PLAYLIST_DIR = os.getenv("LMS_PLAYLIST_DIR", "/var/lib/squeezeboxserver/playlists")
 DEBUG              = os.getenv("BRIDGE_DEBUG", "").lower() == "true"
 LASTFM_API_KEY     = os.getenv("LAST_FM_API_KEY") or os.getenv("LASTFM_API_KEY", "9ed2b1dfa5c3f0ece0a30ec8e69b4742")
@@ -299,12 +305,13 @@ _LOCK_SKIP_SECONDS  = int(os.getenv("BRIDGE_LOCK_SKIP_SECONDS", "30"))      # l�
 _LOCK_SKIP_MAX      = int(os.getenv("BRIDGE_LOCK_SKIP_MAX", "2"))           # max hopp innan stop + rensa
 _IDLE_FLUSH_SECONDS = int(os.getenv("BRIDGE_IDLE_FLUSH_SECONDS", "3600"))   # paus/stopp-tröskel
 _WATCHDOG_POLL      = int(os.getenv("BRIDGE_WATCHDOG_POLL", "10"))          # kollintervall
-_C5_RECOVER_STOP_PLAY = int(os.getenv("BRIDGE_C5_RECOVER_STOP_PLAY", "22"))  # C5: stop→play vid Ns låst
-_C5_RECOVER_SKIP      = int(os.getenv("BRIDGE_C5_RECOVER_SKIP", "40"))       # C5: hoppa spår vid Ns låst
 _last_active_ts = {}   # mac → senaste tidpunkt spelaren faktiskt gjorde framsteg
 _last_elapsed   = {}   # mac → senast sedda elapsed-tid (för att upptäcka frysning)
 _last_track     = {}   # mac → nuvarande spårs identitet (url) — nytt spår = färsk frist
-_c5_recover     = {}   # mac → antal räddningsförsök vakthunden gjort mot en låst C5
+_c5_last_playing = 0.0   # senaste gången C5 bevisligen spelade (0 = okänt → kallstart)
+_c5_desync_since = None  # när LMS-spelar-men-C5-STOPPED började (skuggläge)
+_c5_woken_at     = 0.0   # senaste väckning (en start = flera kommandon → väck en gång)
+_last_mode      = {}   # mac → senast sedda mode (paus/stopp → play = färsk frist)
 _skip_recover   = {}   # mac → antal spårhopp vakthunden gjort mot ett lås (nollställs vid framsteg)
 
 
@@ -349,6 +356,27 @@ def _act_on_active(command_fn):
             acted.append(p.get('name'))
     return acted
 
+def c5_transport_state(timeout=2):
+    """C5:ans EGEN transportstatus via UPnP: 'PLAYING', 'STOPPED', 'TRANSITIONING' …
+    eller None om den inte svarar. Sanningen om högtalaren spelar — LMS:ens elapsed
+    för C5 står på 0 i 6–9 s under en helt normal start och kan gå vidare när C5
+    tystnat (mätt 8 okt 2026). RelTime rapporteras inte (alltid 00:00:00), så bara
+    tillståndet går att använda."""
+    url = f"http://{C5_IP}:49152/upnp/control/rendertransport1"
+    body = ('<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+            's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>'
+            '<u:GetTransportInfo xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">'
+            '<InstanceID>0</InstanceID></u:GetTransportInfo></s:Body></s:Envelope>')
+    headers = {"Content-Type": 'text/xml; charset="utf-8"',
+               "SOAPACTION": '"urn:schemas-upnp-org:service:AVTransport:1#GetTransportInfo"'}
+    try:
+        r = _session.post(url, data=body, headers=headers, timeout=timeout)
+        m = re.search(r"<CurrentTransportState>([^<]+)<", r.text)
+        return m.group(1).strip() if m else None
+    except Exception:
+        return None
+
+
 def set_c5_volume_upnp(volume_level):
     """Sätter volymen på Audio Pro C5 via UPnP — används när C5 kör Spotify Connect."""
     url = f"http://{C5_IP}:49152/upnp/control/rendercontrol1"
@@ -372,83 +400,129 @@ def set_c5_volume_upnp(volume_level):
     except Exception as e:
         print(f"[UPNP ERROR] C5: {e}")
 
-def lms_json_rpc(player_id, command_args, timeout=3):
+def _is_start_command(args) -> bool:
+    """Startar kommandot uppspelning (nytt spår/ny kö/återuppta)?"""
+    a = [str(x) for x in (args or [])]
+    if not a:
+        return False
+    if a[0] == "play":
+        return True
+    if a[0] == "playlist" and len(a) > 1 and a[1] in ("play", "load", "index", "jump"):
+        return True
+    if a[0] in ("spotty", "favorites") and a[1:3] == ["playlist", "play"]:
+        return True
+    return a[0] == "playlistcontrol" and "cmd:load" in a
+
+
+def lms_json_rpc(player_id, command_args, timeout=3, _raw=False):
+    """JSON-RPC mot LMS. Startkommandon till C5 går genom C5-spärren: väckning
+    vid kallstart FÖRE kommandot, startkontroll EFTER — oavsett vilken väg
+    (Edgar, dashboard, transfer …) som startade. `_raw` = C5-logikens egna kommandon."""
+    c5_start = (not _raw and player_id == C5_MAC and _is_start_command(command_args))
+    if c5_start:
+        c5_wake(player_id)
     payload = {"id": 1, "method": "slim.request", "params": [player_id, command_args]}
     try:
-        return _session.post(LMS_URL, json=payload, timeout=timeout).json()
+        res = _session.post(LMS_URL, json=payload, timeout=timeout).json()
     except Exception as e:
         print(f"[ERROR] LMS: {e}")
         return None
+    if c5_start:
+        c5_start_guard(player_id, "brygga")
+    return res
 
-def _c5_coldstart_watch(mac):
-    """C5 (UPnP+Spotty) stammar ofta i kallstart: elapsed BACKAR upprepade gånger
-    (strömmen startar om sig själv). Snabb-pollar (2,5 s) i ~45 s och gör en ren
-    stop→play när 2 sådana restarter setts — det bryter mönstret långt snabbare än
-    vakthundens 10 s-poll. Rör ALDRIG en ström som ökar stabilt (då spelar/buffrar
-    den bara).
+def c5_is_cold() -> bool:
+    return time.time() - _c5_last_playing > C5_COLD_AFTER_S
 
-    STILLASTÅENDE vid start (okt 2026): LMS buffrar fullt men C5 skickar aldrig
-    "Started" — elapsed står på 0. Lämnades förr åt vakthunden (stop→play efter
-    30 s, hopp efter 40 s), men användaren hoppade själv långt innan; i loggen
-    syntes knappt något. Nu: 0 i C5_FREEZE_S → stop→play; fortfarande 0 efter
-    C5_FREEZE_SKIP_S till → hoppa till nästa spår (det som faktiskt fungerar).
-    En normal C5-kallstart tar 1–3 s."""
-    prev = None
-    restarts = 0
-    recoveries = 0
-    stable_since = None
-    frozen_since = time.time()                      # räknas från play-kommandot, inte första pollen
-    freeze_stage = 0                                # 0 = inget gjort, 1 = stop→play, 2 = hoppat
-    deadline = time.time() + 45
-    while time.time() < deadline:
-        time.sleep(2.5)
-        res = lms_json_rpc(mac, ["status", "-", 1, "tags:"])
-        if not res:
-            continue
-        r = res.get("result", {})
-        if _num(r.get("playlist_tracks", 0)) <= 0 or r.get("mode") != "play":
-            return                                  # tomt/pausat/stoppat → sluta bevaka
-        elapsed = _num(r.get("time") or 0)
-        if elapsed <= 0.5:
-            frozen_since = frozen_since or time.time()
-            frozen = time.time() - frozen_since
-            if freeze_stage == 0 and frozen >= C5_FREEZE_S:
-                logging.info(f"[c5-coldstart] {mac} står still på 0 i {frozen:.0f} s — stop→play")
-                lms_json_rpc(mac, ["stop"])
-                time.sleep(0.3)
-                lms_json_rpc(mac, ["play"])
-                freeze_stage, frozen_since, prev = 1, time.time(), None
-                continue
-            if freeze_stage == 1 and frozen >= C5_FREEZE_SKIP_S:
-                logging.info(f"[c5-coldstart] {mac} fortfarande still efter stop→play — hoppar till nästa spår")
-                lms_json_rpc(mac, ["playlist", "index", "+1"])
-                freeze_stage, frozen_since, prev = 2, time.time(), None
-                continue
-            if freeze_stage == 2 and frozen >= C5_FREEZE_SKIP_S:
-                return                              # lämna åt vakthunden
-        else:
-            frozen_since = None
-        if prev is not None:
-            if elapsed > prev + 0.5:                # ökar = spelar
-                stable_since = stable_since or time.time()
-                if time.time() - stable_since >= 5:
-                    return                          # stabil uppspelning i 5 s — klart
-            elif prev - elapsed > 1.0:              # backade = stream-restart
-                restarts += 1
-                stable_since = None
-                logging.info(f"[c5-coldstart] {mac} stream-restart #{restarts} ({prev:.0f}→{elapsed:.0f})")
-                if restarts >= 2 and recoveries < 2:
-                    logging.info(f"[c5-coldstart] {mac} stammar — stabiliserar (stop→play) [{recoveries+1}/2]")
-                    lms_json_rpc(mac, ["stop"])
-                    time.sleep(0.3)
-                    lms_json_rpc(mac, ["play"])
-                    restarts = 0
-                    recoveries += 1
-                    prev = None
-                    stable_since = None
-                    time.sleep(3)                   # låt den etablera efter vår restart
-                    continue
-        prev = elapsed
+
+def c5_wake(mac):
+    """Före play vid KALLSTART: slå på spelaren i LMS och fråga C5 tills den svarar
+    (högst C5_WAKE_MAX_S). Hypotes: C5:ans nätverk somnar efter lång tystnad och
+    missar början av strömmen. Svarstiden loggas — den visar om den sov."""
+    global _c5_woken_at
+    if mac != C5_MAC or not c5_is_cold() or time.time() - _c5_woken_at < 60:
+        return                                    # varm, eller redan väckt för den här starten
+    _c5_woken_at = t0 = time.time()
+    lms_json_rpc(mac, ["power", 1], _raw=True)
+    state = None
+    while time.time() - t0 < C5_WAKE_MAX_S:
+        state = c5_transport_state(timeout=2)
+        if state:
+            break
+        time.sleep(0.5)
+    idle_min = (t0 - _c5_last_playing) / 60 if _c5_last_playing else None
+    logging.info(f"[c5] kallstart (tyst {f'{idle_min:.0f} min' if idle_min else 'okänt'}): "
+                 f"väckt på {time.time() - t0:.1f} s, status={state}")
+
+
+_c5_guard_lock    = threading.Lock()
+_c5_guard_running = False
+_c5_start_t0      = 0.0      # senaste start (en ny start under bevakning förnyar fristen)
+_c5_start_cold    = False
+
+
+def c5_start_guard(mac, via):
+    """Starta startkontrollen (en åt gången). Ny start medan en kör → förnya fristen."""
+    global _c5_guard_running, _c5_start_t0, _c5_start_cold
+    with _c5_guard_lock:
+        _c5_start_t0 = time.time()
+        if _c5_guard_running:
+            return
+        _c5_start_cold = c5_is_cold()
+        _c5_guard_running = True
+    threading.Thread(target=_c5_start_guard, args=(mac, via), daemon=True).start()
+
+
+def _c5_start_guard(mac, via):
+    """Efter en start: fråga C5 var 2:a s. PLAYING → klart (tiden loggas, kall/varm).
+    Inte PLAYING efter C5_START_RETRY_S → stop→play; efter C5_START_SKIP_S → nästa
+    spår. Avbryter om LMS inte längre spelar (man pausade/stoppade själv)."""
+    global _c5_last_playing, _c5_guard_running
+    retried = False
+    kind = f"{'kall' if _c5_start_cold else 'varm'} start ({via})"
+    try:
+        while True:
+            time.sleep(2.0)
+            t = time.time() - _c5_start_t0
+            res = lms_json_rpc(mac, ["status", "-", 1, "tags:"], _raw=True)
+            if not res or res.get("result", {}).get("mode") != "play":
+                logging.info(f"[c5] {kind}: LMS spelar inte längre efter {t:.0f} s — slutar bevaka")
+                return
+            state = c5_transport_state()
+            if state == "PLAYING":
+                _c5_last_playing = time.time()
+                logging.info(f"[c5] {kind}: PLAYING efter {t:.0f} s{' (efter stop→play)' if retried else ''}")
+                return
+            if not retried and t >= C5_START_RETRY_S:
+                logging.info(f"[c5] {kind}: status={state} efter {t:.0f} s — stop→play")
+                lms_json_rpc(mac, ["stop"], _raw=True); time.sleep(0.3)
+                lms_json_rpc(mac, ["play"], _raw=True)
+                retried = True
+            elif retried and t >= C5_START_SKIP_S:
+                logging.info(f"[c5] {kind}: status={state} efter {t:.0f} s — hoppar till nästa spår")
+                lms_json_rpc(mac, ["playlist", "index", "+1"], _raw=True)
+                return
+    finally:
+        with _c5_guard_lock:
+            _c5_guard_running = False
+
+
+def _c5_check_desync(name):
+    """SKUGGLÄGE: LMS spelar och klockan tickar, men C5 själv är tyst (STOPPED).
+    Hände 8 okt 2026: ljudet tog slut med spåret, LMS:ens klocka fortsatte, köket
+    tystnade. Loggar "skulle ha hoppat" efter C5_DESYNC_S — åtgärdar inget ännu."""
+    global _c5_last_playing, _c5_desync_since
+    state = c5_transport_state()
+    if state == "PLAYING":
+        _c5_last_playing = time.time()
+        _c5_desync_since = None
+        return
+    if state is None:
+        return                                    # svarar inte — ingen slutsats
+    _c5_desync_since = _c5_desync_since or time.time()
+    gap = time.time() - _c5_desync_since
+    if C5_DESYNC_S <= gap < C5_DESYNC_S + _WATCHDOG_POLL:
+        logging.info(f"[c5] SKUGGA: {name} LMS spelar men C5 säger {state} i {gap:.0f} s — skulle ha hoppat till nästa spår")
 
 
 def _deferred_kick(player_mac, delay=5.0, attempts=4):
@@ -463,13 +537,10 @@ def _deferred_kick(player_mac, delay=5.0, attempts=4):
         UPnP-renderare (t.ex. Audio Pro C5) tolkar ofta 'playlist jump' till SAMMA
         index som en no-op, så den mjuka knuffen räcker inte alltid; stop→play
         tvingar en färsk ström. Avbryter så fort elapsed tickar."""
-    # C5 (UPnP+Spotty) har en skakig kallstart och sköts av en dedikerad snabb
-    # kallstartsvakt i stället för den generiska kicken (10 s-upplösning är för
-    # trubbig för en ~3 s-stamning; och en kick i buffringsfönstret startar bara
-    # om strömmen). Genuina frysningar tas av vakthundens tålmodiga C5-räddning.
+    # C5 (UPnP) sköts av en egen startkontroll som frågar högtalaren själv —
+    # den generiska kicken läser LMS:ens elapsed, som inte går att lita på för C5.
     if player_mac == C5_MAC:
-        threading.Thread(target=_c5_coldstart_watch, args=(player_mac,), daemon=True).start()
-        return
+        return   # startkontrollen startades redan av C5-spärren i lms_json_rpc
     def _kick():
         frozen_kicks = 0   # antal knuffar mot en fryst-vid-start-ström
         for _ in range(attempts):
@@ -814,6 +885,7 @@ def _watchdog_tick():
     """Ett varv: döda spelare som inte kommer framåt. Lås (mode 'play' men fryst)
     rensas efter _LOCK_KILL_SECONDS, paus/stopp efter _IDLE_FLUSH_SECONDS. Ingen
     återupplivning. Anropas av _watchdog_loop var _WATCHDOG_POLL:e sekund."""
+    global _c5_last_playing
     now = time.time()
     seen = set()
     for p in get_all_players():
@@ -834,21 +906,34 @@ def _watchdog_tick():
 
         prev_elapsed = _last_elapsed.get(mac)
         _last_elapsed[mac] = elapsed
+        # Paus/stopp → play (återupptagen, samma spår) = färsk frist. Annars räknades
+        # pausen som lås: 8 okt 2026 "C5 låst 541s" → stop→play + hopp en sekund efter
+        # att man tryckt play.
+        prev_mode = _last_mode.get(mac)
+        _last_mode[mac] = mode
+        resumed = mode == 'play' and prev_mode is not None and prev_mode != 'play'
         # Nytt spår laddat → färsk frist. Annars dödas en kallstartande ström direkt
         # om spelaren stått idle/pausad länge innan (stale _last_active_ts-klocka).
         prev_track = _last_track.get(mac)
         _last_track[mac] = track_key
         track_changed = track_key is not None and track_key != prev_track
+        # C5 startad UTANFÖR bryggan (Lyrion-appen m.m.): starta startkontrollen här.
+        # Väckning i förväg går inte — starten har redan skett. Naturliga spårbyten
+        # under pågående spel räknas inte (C5 sågs spela nyss).
+        if (mac == C5_MAC and mode == 'play' and (resumed or track_changed)
+                and now - _c5_last_playing > 15):
+            c5_start_guard(mac, "extern")
 
         # Framsteg = spelar OCH elapsed har ÖKAT (en backning/frysning = inte framsteg).
         making_progress = mode == 'play' and (prev_elapsed is None or elapsed > prev_elapsed)
 
         if making_progress:
             _last_active_ts[mac] = now
-            _c5_recover.pop(mac, None)   # äkta framsteg → nollställ räddningsräknaren
             _skip_recover.pop(mac, None)
+            if mac == C5_MAC:
+                _c5_check_desync(name)
             continue
-        if track_changed:
+        if track_changed or resumed:
             _last_active_ts[mac] = now
             continue
 
@@ -866,29 +951,15 @@ def _watchdog_tick():
         # Paus/stopp kan vara medvetet → ge en timme innan kön rensas.
         is_lock = mode == 'play'
 
-        # C5-RÄDDNING (UPnP): väck bara en MID-STREAM-frysning (elapsed > 0 → strömmen
-        # spelade och hängde sig). En KALLSTART står på elapsed≈0 medan MP3-strömmen
-        # buffrar (~15–30 s); ett stop→play där startar bara om buffringen och ger
-        # "hoppar till 0 om och om igen". Kallstart lämnas därför till 60 s-backstopen
-        # nedan — MP3 latchar långt innan dess. (Före MP3-codec-fixen var C5 lossless
-        # FLAC och underrannade även mid-stream; då behövdes den aggressiva räddningen
-        # även vid elapsed=0. Nollställs vid äkta framsteg ovan.)
-        if is_lock and mac == C5_MAC and elapsed >= 2.0 and frozen_for >= _C5_RECOVER_STOP_PLAY:
-            n = _c5_recover.get(mac, 0)
-            if n == 0:
-                logging.info(f"[watchdog] {name} C5 låst {int(frozen_for)}s — väcker (stop→play)")
-                lms_json_rpc(mac, ["stop"])
-                time.sleep(0.3)
-                lms_json_rpc(mac, ["play"])
-                _c5_recover[mac] = 1
-                continue
-            if n == 1 and frozen_for >= _C5_RECOVER_SKIP:
-                logging.info(f"[watchdog] {name} C5 fortsatt låst {int(frozen_for)}s — hoppar till nästa spår")
-                lms_json_rpc(mac, ["playlist", "index", "+1"])
-                _c5_recover[mac] = 2
-                continue
+        # C5: LMS-klockan står still, men det betyder inget förrän C5 själv bekräftar.
+        # Säger C5 PLAYING spelar den — rör inget och starta om frysklockan. Annars
+        # behandlas C5 som alla andra spelare nedan (hopp, sedan stop + rensa).
+        if is_lock and mac == C5_MAC and c5_transport_state() == "PLAYING":
+            _c5_last_playing = now
+            _last_active_ts[mac] = now
+            continue
 
-        # HOPP-RÄDDNING (alla spelare utom C5, som har sin egen väg ovan): ett lås
+        # HOPP-RÄDDNING (alla spelare; C5 bara när den själv sagt att den inte spelar): ett lås
         # med fler spår i kön är oftast EN hängd strömstart — typiskt Spotty-helpern
         # som aldrig levererar nästa spår (verkligt fall 2026-09-15: Goldfrapp spelade
         # klart, spotty-x86_64 för spår 2 hängde tyst i 75 s, vakthunden kastade 17
@@ -897,7 +968,7 @@ def _watchdog_tick():
         # → färsk frist, så nästa spår får egen _LOCK_SKIP_SECONDS-frist.
         cur_index = int(_num(r.get('playlist_cur_index')))
         has_next  = cur_index < playlist_tracks - 1
-        if is_lock and mac != C5_MAC and has_next and frozen_for >= _LOCK_SKIP_SECONDS:
+        if is_lock and has_next and frozen_for >= _LOCK_SKIP_SECONDS:
             n = _skip_recover.get(mac, 0)
             if n < _LOCK_SKIP_MAX:
                 logging.info(
@@ -928,7 +999,6 @@ def _watchdog_tick():
             _last_active_ts[mac] = now   # nollställ klockan efter åtgärd
             _last_elapsed.pop(mac, None)
             _last_track.pop(mac, None)
-            _c5_recover.pop(mac, None)
             _skip_recover.pop(mac, None)
 
     # Glöm spelare som försvunnit (avstängda) så dictarna inte växer obegränsat.
@@ -937,7 +1007,6 @@ def _watchdog_tick():
             _last_active_ts.pop(mac, None)
             _last_elapsed.pop(mac, None)
             _last_track.pop(mac, None)
-            _c5_recover.pop(mac, None)
             _skip_recover.pop(mac, None)
 
 
