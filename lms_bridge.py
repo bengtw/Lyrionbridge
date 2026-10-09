@@ -630,6 +630,11 @@ def _strip_definite(s: str) -> str:
     return s
 
 
+# Enheters fasta rumsnamn → LMS-spelarens namn. Köksvredet skickar "c5", men spelaren
+# heter "Köket" (döptes om), så "c5" matchade ingen spelare och gav 404.
+_ROOM_ALIASES = {"c5": "köket"}
+
+
 def get_player_info(room_arg):
     """Matcher dynamiskt rummet mot aktiva spelare i LMS."""
     players = get_all_players()
@@ -640,6 +645,7 @@ def get_player_info(room_arg):
         return players[0].get('playerid'), players[0].get('name')
 
     decoded = urllib.parse.unquote(room_arg).strip().lower()
+    decoded = _ROOM_ALIASES.get(decoded, decoded)
 
     if ":" in decoded:
         for p in players:
@@ -1357,7 +1363,7 @@ def set_volume():
     if not player_mac:
         return "Error", 404
     level_str = str(level).strip()
-    if "c5" in room_name.lower():
+    if player_mac == C5_MAC:   # på MAC, inte namn — spelaren döptes om från "C5" till "Köket"
         set_c5_volume_upnp(level_str)
     if level_str.startswith(('+', '-')):
         lms_json_rpc(player_mac, ["mixer", "volume", level_str])
@@ -1599,35 +1605,79 @@ def get_daily_mixes_knob():
         lines.append(f"{title}|{label}|{idx}")
     return '\n'.join(lines), 200, {'Content-Type': 'text/plain; charset=utf-8'}
 
-_BUTTON_PROMPTS_FILE = Path(__file__).parent / "button_prompts.json"
+_BUTTONS_FILE    = Path(__file__).parent / "buttons.json"
+_BUTTON_REPEAT_S = 20      # samma musikval i samma rum inom N s = dubbeltryck, ignoreras
+_button_last: dict[tuple[str, str, str], float] = {}
+_button_lock = threading.Lock()
 
-@app.route('/button_prompt')
-def button_prompt():
-    """Mappar en knapptryckning till en Edgar-prompt.
-    ?id=1&room=vardagsrum — fire-and-forget till Edgar /api/chat."""
-    btn_id = request.args.get('id', '').strip()
+
+def _button_action(room: str, btn_id: str, press: str):
+    """Slår upp handlingen i buttons.json: rummets egen karta, annars "default"."""
+    cfg = json.loads(_BUTTONS_FILE.read_text())
+    mapping = cfg.get(room) or cfg.get("default") or {}
+    return (mapping.get(btn_id) or {}).get(press)
+
+
+def _run_button_action(action, room: str, player_mac: str):
+    """play_pause | next | {"daily": N} | {"warm": "önskemål"} | {"prompt": "Edgar-prompt"}"""
+    if action == "play_pause":
+        lms_json_rpc(player_mac, ["pause"])
+    elif action == "next":
+        lms_json_rpc(player_mac, ["playlist", "index", "+1"])
+    elif isinstance(action, dict) and "daily" in action:
+        lms_play_stream(player_mac, ["spotty", "playlist", "play", f"item_id:playlists.{int(action['daily'])}"])
+        _mark_queue_origin(player_mac, "daily_mix")
+    elif isinstance(action, dict) and "warm" in action:
+        # Bästa FÖRVÄRMDA DJ-listan för önskemålet — Edgar svarar direkt, spelar i bakgrunden
+        requests.post(f"{EDGAR_URL}/api/warm_button", json={"query": action["warm"], "room": room}, timeout=5)
+    elif isinstance(action, dict) and "prompt" in action:
+        requests.post(f"{EDGAR_URL}/api/chat", timeout=60, json={
+            "message": action["prompt"], "client_id": f"remote_{room}", "default_room": room})
+    else:
+        logging.warning(f"[button] okänd handling: {action!r}")
+
+
+@app.route('/button')
+def button():
+    """Fysiska knappar utan skärm (köksvredet). Enheten skickar bara VILKEN knapp och
+    HUR den trycktes — vad det betyder står i buttons.json, så ändringar kräver ingen
+    omflashning. ?room=c5&id=1&press=short|double|long. Svarar direkt."""
     room   = request.args.get('room', '').strip()
+    btn_id = request.args.get('id', '').strip()
+    press  = request.args.get('press', 'short').strip()
 
     try:
-        prompts = json.loads(_BUTTON_PROMPTS_FILE.read_text())
+        action = _button_action(room, btn_id, press)
     except Exception:
-        return jsonify({"error": "button_prompts.json saknas eller ogiltig"}), 500
+        return jsonify({"error": "buttons.json saknas eller ogiltig"}), 500
+    if not action:
+        logging.info(f"[button] {room} knapp {btn_id} {press}: ingen handling")
+        return jsonify({"status": "unmapped", "room": room, "button": btn_id, "press": press})
 
-    prompt = prompts.get(btn_id)
-    if not prompt:
-        return jsonify({"error": f"Ingen prompt för knapp {btn_id!r}"}), 404
+    player_mac, _ = get_player_info(room)
+    if not player_mac:
+        return "Error", 404
 
-    payload = {
-        "message":      prompt,
-        "client_id":    f"remote_{room or 'default'}",
-        "default_room": room or None,
-    }
-    try:
-        requests.post(f"{EDGAR_URL}/api/chat", json=payload, timeout=60)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 502
+    # Musikval (allt utom play/paus och nästa): enheten saknar återkoppling, så ett
+    # andra tryck medan listan laddas är vanligt och skulle starta en till.
+    if isinstance(action, dict):
+        now = time.time()
+        with _button_lock:
+            if now - _button_last.get((room, btn_id, press), 0) < _BUTTON_REPEAT_S:
+                logging.info(f"[button] {room} knapp {btn_id} {press}: dubbeltryck ignorerat")
+                return jsonify({"status": "ignored", "room": room, "button": btn_id, "press": press})
+            _button_last[(room, btn_id, press)] = now
 
-    return jsonify({"status": "ok", "button": btn_id, "room": room, "prompt": prompt})
+    logging.info(f"[button] {room} knapp {btn_id} {press}: {action!r}")
+
+    def _run():
+        try:
+            _run_button_action(action, room, player_mac)
+        except Exception as e:
+            logging.warning(f"[button] {room} knapp {btn_id} {press} misslyckades: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "ok", "room": room, "button": btn_id, "press": press, "action": action})
 
 
 @app.route('/get_radio_favorites')

@@ -10,7 +10,7 @@ A Python bridge for [Lyrion Music Server](https://lyrion.org) that acts as the m
 | `lms_logger.py` | Daemon subscribing to LMS CLI events, logging plays to SQLite, estimating audio features via Gemini |
 | `play_history.db` | SQLite — play log, skip flags, audio features cache, track features cache |
 | `metadata_cache.db` | SQLite — Spotify search result cache + AI-generated Daily Mix labels |
-| `button_prompts.json` | Maps button IDs to Edgar prompts for physical remotes |
+| `buttons.json` | Maps physical button presses (id + short/double/long) to actions, per room |
 
 ## Features
 
@@ -22,7 +22,7 @@ A Python bridge for [Lyrion Music Server](https://lyrion.org) that acts as the m
 - **Audio features** — energy/valence/danceability/tempo estimated via Gemini, cached to avoid repeat API calls
 - **Spotify caching** — search results cached on disk (30 days for tracks, 7 days for albums/artists/playlists)
 - **Daily Mix labels** — AI-generated 1–2 word Swedish style labels per Daily Mix (e.g. "EBM-klubb", "80-talssynth"), refreshed every 6 hours
-- **Button prompts** — physical remotes with no screen can trigger Edgar prompts via `/button_prompt`
+- **Buttons** — remotes with no screen send only which button and how it was pressed to `/button`; `buttons.json` decides the action (play/pause, next, Daily Mix, pre-warmed DJ list, Edgar prompt) — no reflashing
 
 ## Requirements
 
@@ -91,7 +91,7 @@ The bridge is an API only — it serves no web UI. The music interface lives in 
 | `GET /get_playlists_with_art` | List saved playlists with artwork |
 | `GET /get_daily_mixes` | List Spotify Daily Mixes |
 | `GET /get_daily_mixes_knob` | Daily Mix 1–6 as `title\|AI-label\|index` lines for display devices |
-| `GET /button_prompt?id=N&room=...` | Trigger an Edgar prompt mapped to button N (see `button_prompts.json`) |
+| `GET /button?room=...&id=N&press=short|double|long` | Run the action mapped in `buttons.json` |
 
 ### Search
 

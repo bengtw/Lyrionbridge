@@ -1,0 +1,9 @@
+{
+  "_doc": "Knappar utan skärm → /button?room=&id=&press=short|double|long. Rummets karta, annars default. Handlingar: \"play_pause\", \"next\", {\"daily\": 0-5}, {\"warm\": \"önskemål → bästa förvärmda DJ-lista\"}, {\"prompt\": \"valfri Edgar-prompt\"}. Läses vid varje tryck — ingen omstart behövs.",
+  "c5": {
+    "0": {"short": "play_pause", "double": "next", "long": "play_pause"},
+    "1": {"short": {"warm": "en lugn middag/matlagningslista"}, "long": {"daily": 0}},
+    "2": {"short": {"warm": "en peppig städa-köket-lista"}, "long": {"daily": 1}},
+    "3": {"short": {"warm": "en lite allmän lista med musik Bengt gillar"}, "long": {"daily": 2}}
+  }
+}
