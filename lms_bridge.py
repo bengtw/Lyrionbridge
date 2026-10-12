@@ -1416,22 +1416,88 @@ def get_title():
     except (KeyError, TypeError, IndexError):
         return ""
 
+# ── Transport: EN uppsättning regler för alla vägar (12 okt 2026) ─────────────
+# Edgar, dashboarden, köksvredet, Pi:ns F3 och menyradsappen hade var sina tolkningar:
+# "paus" var en växling som startade en pausad spelare, och Edgars "spela" på en
+# spelande spelare pausade den. Nu:
+#   toggle — växlar (bara för knappar som SER ut som play/paus)
+#   pause  — pausar en spelande spelare, startar ALDRIG något
+#   play   — återupptar en pausad / startar en stoppad, pausar ALDRIG
+#   stop   — stoppar
+# Utan rum: pause/stop gäller alla spelare som spelar (stop även pausade); förut tog
+# get_player_info(None) den FÖRSTA spelaren i LMS-listan, oavsett om den spelade.
+# Rösten har en egen regel ovanpå (ett tyst rum → de som spelar) i Edgars
+# tool_music_control, eftersom modellen ofta lägger till rum som aldrig sagts.
+
+def _player_mode(mac) -> str | None:
+    res = lms_json_rpc(mac, ["mode", "?"], _raw=True)
+    try:
+        return res['result']['_mode']
+    except (KeyError, TypeError):
+        return None
+
+
+def transport(mac, action) -> str | None:
+    """Kör en transporthandling enligt reglerna ovan. Returnerar läget efteråt-ish
+    ('play'/'pause'/'stop') eller None om inget gjordes."""
+    if action == "toggle":
+        lms_json_rpc(mac, ["pause"])
+        return "toggle"
+    if action == "stop":
+        lms_json_rpc(mac, ["stop"])
+        return "stop"
+    mode = _player_mode(mac)
+    if action == "pause":
+        if mode != "play":
+            return None                      # pausad/stoppad: rör inte (växling hade startat)
+        lms_json_rpc(mac, ["pause", "1"])
+        return "pause"
+    if action == "play":
+        if mode == "play":
+            return None                      # spelar redan: en växling hade pausat
+        lms_json_rpc(mac, ["pause", "0"] if mode == "pause" else ["play"])
+        return "play"
+    raise ValueError(f"okänd transporthandling: {action}")
+
+
+def _active_macs(include_paused: bool) -> list[tuple[str, str]]:
+    out = []
+    for p in get_all_players():
+        mac = p.get('playerid')
+        if mac and _player_mode(mac) in (("play", "pause") if include_paused else ("play",)):
+            out.append((mac, p.get('name')))
+    return out
+
+
+def _transport_route(action):
+    room = (request.args.get('room') or "").strip()
+    if not room and action in ("pause", "stop"):
+        targets = _active_macs(include_paused=(action == "stop"))
+    else:
+        mac, name = get_player_info(room)
+        if not mac:
+            return jsonify({"error": f"okänt rum: {room}"}), 404
+        targets = [(mac, name)]
+    acted = [name for mac, name in targets if transport(mac, action)]
+    logging.info(f"[transport] {action} {room or '(alla aktiva)'} → {acted or 'inget att göra'}")
+    return jsonify({"action": action, "acted": acted})
+
+
 @app.route('/stop')
 def stop_playback():
-    player_mac, _ = get_player_info(request.args.get('room'))
-    if not player_mac:
-        return "Error", 404
-    lms_json_rpc(player_mac, ["stop"])
-    return "OK"
+    return _transport_route("stop")
+
+@app.route('/pause')
+def pause_playback():
+    return _transport_route("pause")
+
+@app.route('/play')
+def play_playback():
+    return _transport_route("play")
 
 @app.route('/toggle_play_pause')
 def toggle_playback():
-    player_mac, room_name = get_player_info(request.args.get('room'))
-    if not player_mac:
-        return "Error", 404
-    print(f"[TOGGLE] {room_name} ({player_mac})", flush=True)
-    lms_json_rpc(player_mac, ["pause"])
-    return "OK"
+    return _transport_route("toggle")
 
 @app.route('/next')
 def next_track():
@@ -1639,7 +1705,7 @@ def _button_action(room: str, btn_id: str, press: str):
 def _run_button_action(action, room: str, player_mac: str):
     """play_pause | next | {"daily": N} | {"warm": "önskemål"} | {"prompt": "Edgar-prompt"}"""
     if action == "play_pause":
-        lms_json_rpc(player_mac, ["pause"])
+        transport(player_mac, "toggle")
     elif action == "next":
         lms_json_rpc(player_mac, ["playlist", "index", "+1"])
     elif isinstance(action, dict) and "daily" in action:
@@ -1940,8 +2006,10 @@ def resolve_player_endpoint():
 
 @app.route('/stop_active')
 def stop_active():
-    """Stoppar alla spelare som för närvarande spelar."""
-    stopped = _act_on_active(lambda mac: lms_json_rpc(mac, ["pause", 1]))
+    """PAUSAR alla spelare som spelar (trots namnet — ett äldre gränssnitt; samma som
+    /pause utan rum). Ingen känd anropare i koden 12 okt 2026, därför loggas avsändaren."""
+    logging.info(f"[transport] /stop_active från {request.remote_addr}")
+    stopped = [name for mac, name in _active_macs(include_paused=False) if transport(mac, "pause")]
     return jsonify({'stopped': stopped})
 
 
@@ -2955,11 +3023,11 @@ def love_track():
 
 @app.route('/deck_play_pause')
 def deck_play_pause():
-    """Skickar play/pause-toggle till kontoret."""
+    """Play/paus-växling i kontoret — Pi:ns F3-tangent (edgar_client._deck_play_pause)."""
     mac, name = get_player_info("kontoret")
     if not mac:
         return jsonify({"error": f"Hittade inte kontoret"}), 404
-    lms_json_rpc(mac, ["pause"])
+    transport(mac, "toggle")
     return jsonify({"action": "toggle", "player": name})
 
 
