@@ -306,6 +306,12 @@ _LOCK_SKIP_SECONDS  = int(os.getenv("BRIDGE_LOCK_SKIP_SECONDS", "30"))      # l�
 _LOCK_SKIP_MAX      = int(os.getenv("BRIDGE_LOCK_SKIP_MAX", "2"))           # max hopp innan stop + rensa
 _IDLE_FLUSH_SECONDS = int(os.getenv("BRIDGE_IDLE_FLUSH_SECONDS", "3600"))   # paus/stopp-tröskel
 _WATCHDOG_POLL      = int(os.getenv("BRIDGE_WATCHDOG_POLL", "10"))          # kollintervall
+# Framsteg kräver att elapsed ökat minst så här mycket sedan förra varvet (ett spelande
+# spår ökar ~_WATCHDOG_POLL s). 12 okt 2026: efter en låt som tagit slut kröp Lyrions
+# elapsed 252 → 252,8 s på 2½ minut, och varje bråkdels ökning räknades som framsteg —
+# vardagsrummet var tyst 2 min 40 s innan vakthunden reagerade.
+_MIN_PROGRESS_S     = float(os.getenv("BRIDGE_MIN_PROGRESS_S", "3"))
+_PAST_END_MARGIN_S  = 2.0     # elapsed förbi spårets längd + marginal = spåret är slut, inget framsteg
 _last_active_ts = {}   # mac → senaste tidpunkt spelaren faktiskt gjorde framsteg
 _last_elapsed   = {}   # mac → senast sedda elapsed-tid (för att upptäcka frysning)
 _last_track     = {}   # mac → nuvarande spårs identitet (url) — nytt spår = färsk frist
@@ -900,7 +906,7 @@ def _watchdog_tick():
         if not mac:
             continue
         seen.add(mac)
-        res = lms_json_rpc(mac, ["status", "-", 1, "tags:u"])
+        res = lms_json_rpc(mac, ["status", "-", 1, "tags:ud"])
         if not res or 'result' not in res:
             continue
         r = res['result']
@@ -931,8 +937,12 @@ def _watchdog_tick():
                 and now - _c5_last_playing > 15):
             c5_start_guard(mac, "extern")
 
-        # Framsteg = spelar OCH elapsed har ÖKAT (en backning/frysning = inte framsteg).
-        making_progress = mode == 'play' and (prev_elapsed is None or elapsed > prev_elapsed)
+        # Framsteg = spelar OCH elapsed har ökat MÄRKBART (minst _MIN_PROGRESS_S) och ligger
+        # inte förbi spårets slut. En backning, frysning eller krypning är inget framsteg.
+        duration = _num(r.get('duration'))
+        past_end = duration > 0 and elapsed > duration + _PAST_END_MARGIN_S
+        making_progress = mode == 'play' and not past_end and (
+            prev_elapsed is None or elapsed - prev_elapsed >= _MIN_PROGRESS_S)
 
         if making_progress:
             _last_active_ts[mac] = now
