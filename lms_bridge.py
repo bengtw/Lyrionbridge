@@ -2589,6 +2589,27 @@ def mark_queue_origin():
     return jsonify({"ok": True})
 
 
+@app.route('/lms', methods=['POST'])
+def lms_passthrough():
+    """Genomsläpp för LMS JSON-RPC: {player, command, timeout?} → LMS-svaret.
+    Edgars alla LMS-kommandon går hit i stället för direkt till Lyrion, så att
+    spärrarna i lms_json_rpc (C5:ans väckning och startvakt) gäller för varje väg
+    (12 okt 2026 — dashboardens föregående/hoppa, genrelistor, Lyrion-spellistor
+    och Artist Radio startade förut köket utan dem)."""
+    data = request.get_json(force=True, silent=True) or {}
+    command = data.get("command")
+    if not isinstance(command, list) or not command:
+        return jsonify({"error": "command (lista) krävs"}), 400
+    try:
+        timeout = min(float(data.get("timeout") or 12), 60)
+    except (TypeError, ValueError):
+        timeout = 12
+    res = lms_json_rpc(data.get("player") or "", command, timeout=timeout)
+    if res is None:
+        return jsonify({"error": "LMS svarade inte"}), 502
+    return jsonify(res)
+
+
 @app.route('/mark_origin', methods=['POST'])
 def mark_origin():
     """Skriver köade spår till pending_origins-tabellen så lms_logger kan märka
