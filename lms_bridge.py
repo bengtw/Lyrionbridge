@@ -10,6 +10,7 @@ import random
 import time
 import urllib.parse
 from pathlib import Path
+import volume_cal
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, send_from_directory, jsonify
 def _load_dotenv(path):
@@ -1356,20 +1357,27 @@ def play_random_album():
     except (KeyError, TypeError, IndexError):
         return "LMS Error", 500
 
-@app.route('/set_volume')
-def set_volume():
-    level = request.args.get('level', '30')
-    player_mac, room_name = get_player_info(request.args.get('room'))
-    if not player_mac:
-        return "Error", 404
+def _set_player_volume(player_mac, level):
+    """Sätter volymen på en spelare. C5:an har en EGEN volym vid sidan av Lyrions
+    och måste sättas över UPnP också — styrt på MAC, inte namn (spelaren döptes om
+    från "C5" till "Köket" och namnstyrningen slutade då fungera tyst)."""
     level_str = str(level).strip()
-    if player_mac == C5_MAC:   # på MAC, inte namn — spelaren döptes om från "C5" till "Köket"
+    if player_mac == C5_MAC:
         set_c5_volume_upnp(level_str)
     if level_str.startswith(('+', '-')):
         lms_json_rpc(player_mac, ["mixer", "volume", level_str])
     else:
         lms_json_rpc(player_mac, ["mixer", "volume", int(level_str)])
     return level_str
+
+
+@app.route('/set_volume')
+def set_volume():
+    level = request.args.get('level', '30')
+    player_mac, room_name = get_player_info(request.args.get('room'))
+    if not player_mac:
+        return "Error", 404
+    return _set_player_volume(player_mac, level)
 
 @app.route('/volume')
 def get_volume():
@@ -1752,9 +1760,20 @@ def transfer_playback():
     if not current_url:
         return "Could not get current track URL", 400
 
+    # Volymen normaliseras FÖRE uppspelningen: rummen har olika och ojämna skalor
+    # (volume_cal, uppmätt på gehör 12 okt 2026), och mottagarrummet kan stå högt
+    # sedan sist — sätts nivån efteråt hinner det smälla till. Omätta rum ger None
+    # och lämnas i fred. Här, i bryggan, eftersom ALLA flyttar passerar den här vägen.
+    tgt_vol = volume_cal.equivalent_volume(from_mac, to_mac, r.get('mixer volume'))
+
     if to_mac == C5_MAC:
         lms_json_rpc(to_mac, ["power", 1])
-        set_c5_volume_upnp(20)
+    if tgt_vol is not None:
+        _set_player_volume(to_mac, tgt_vol)     # sätter även C5:ans egen volym
+        logging.info(f"[transfer] volym {r.get('mixer volume')} → {tgt_vol} ({from_mac} → {to_mac})")
+    elif to_mac == C5_MAC:
+        set_c5_volume_upnp(20)                  # gammalt beteende när rummet saknar mätning
+    if to_mac == C5_MAC:
         time.sleep(2.0)
 
     lms_json_rpc(to_mac, ["playlist", "play", current_url])
