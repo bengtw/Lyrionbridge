@@ -1363,6 +1363,16 @@ def _set_player_volume(player_mac, level):
     från "C5" till "Köket" och namnstyrningen slutade då fungera tyst)."""
     level_str = str(level).strip()
     if player_mac == C5_MAC:
+        # C5:ans UPnP tar bara absoluta nivåer och tolkar "+10" som 10: "höj volymen" i
+        # köket sänkte C5:an till 10 (uppmätt 12 okt 2026, "+1" → 1). Räkna fram nivån
+        # ur Lyrions volym och sätt BÅDA absolut.
+        if level_str.startswith(('+', '-')):
+            res = lms_json_rpc(player_mac, ["mixer", "volume", "?"])
+            try:
+                current = int(float(res['result']['_volume']))
+            except (KeyError, TypeError, ValueError):
+                current = 30
+            level_str = str(max(0, min(100, current + int(level_str))))
         set_c5_volume_upnp(level_str)
     if level_str.startswith(('+', '-')):
         lms_json_rpc(player_mac, ["mixer", "volume", level_str])
