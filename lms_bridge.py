@@ -314,9 +314,34 @@ _WATCHDOG_POLL      = int(os.getenv("BRIDGE_WATCHDOG_POLL", "10"))          # ko
 # elapsed 252 → 252,8 s på 2½ minut, och varje bråkdels ökning räknades som framsteg —
 # vardagsrummet var tyst 2 min 40 s innan vakthunden reagerade.
 _MIN_PROGRESS_S     = float(os.getenv("BRIDGE_MIN_PROGRESS_S", "3"))
+# Häng VID LÅTSLUT (13 okt 2026): tiden har nått låtens fulla längd och står still → nästa
+# spår startade aldrig. Vid ett normalt byte (Linn i flow-läge) tar nästa låt över INNAN
+# tiden når längden, så läget är ett säkert tecken på häng — hoppa efter _END_STALL_SKIP_S i
+# stället för _LOCK_SKIP_SECONDS. En ren tidsgräns hade inte gått: 5 % av de normala bytena
+# dröjde > 10 s, och ett hopp då hade hoppat över nästa låt.
+_END_STALL_SKIP_S   = float(os.getenv("BRIDGE_END_STALL_SKIP_S", "8"))
+_AT_END_MARGIN_S    = 1.0
 _PAST_END_MARGIN_S  = 2.0     # elapsed förbi spårets längd + marginal = spåret är slut, inget framsteg
+# Falskt låtslut (13 okt 2026): UPnP-bryggans tidsräkning för Linn kan hoppa. 15:13:39
+# "elapse roll-back detected" → Lyrion sade 276 av 275 s när bara ~210 s hade spelats (Lyrion
+# skickade ljud till Linn i 9 s till), och regeln ovan hoppade över låtens sista minut. Därför
+# en TROVÄRDIG position: elapsed flyttas bara fram med högst väggtiden + _JUMP_TOLERANCE_S
+# (Linns ryckiga ikapphopp ryms). Ett större hopp (sökning eller fel) godtas först när
+# tiden fortsätter framåt därifrån. Säger Lyrion "slut" före den trovärdiga positionens
+# slut väntar vakthunden ut den verkliga längden innan snabbhoppet.
+_JUMP_TOLERANCE_S   = 15.0
+# Skuggläge (13 okt 2026): för de här spelarna loggar vakthunden vad den SKULLE ha gjort vid
+# ett lås, och om det löste sig självt, men gör inget. Vardagsrummet (Linn via UPnP-bryggan):
+# flera hopp den dagen visade sig vara tidsfel från bryggan medan musiken spelade, och det är
+# okänt om tystnaderna vid låtslut hade släppt utan hjälp. Kommaseparerade MAC-adresser.
+_SHADOW_MACS = {m.strip().lower() for m in
+                os.getenv("BRIDGE_WATCHDOG_SHADOW_MACS", "bb:bb:4d:b0:d0:06").split(",") if m.strip()}
+_shadow_since   = {}   # mac → (tidpunkt, åtgärd, elapsed, spår) för ett pågående skugglås
+_trusted_pos    = {}   # mac → (elapsed, tidpunkt) senast trovärdiga position
+_jump_seen      = {}   # mac → (elapsed, tidpunkt) för ett hopp som inte godtagits ännu
+_false_end_logged = {} # mac → redan loggat "säger slut men…" för det här hänget
 _last_active_ts = {}   # mac → senaste tidpunkt spelaren faktiskt gjorde framsteg
-_last_elapsed   = {}   # mac → senast sedda elapsed-tid (för att upptäcka frysning)
+_last_elapsed   = {}   # mac → elapsed vid senast bekräftade framsteg (för att upptäcka frysning)
 _last_track     = {}   # mac → nuvarande spårs identitet (url) — nytt spår = färsk frist
 _c5_last_playing = 0.0   # senaste gången C5 bevisligen spelade (0 = okänt → kallstart)
 _c5_desync_since = None  # när LMS-spelar-men-C5-STOPPED började (skuggläge)
@@ -925,8 +950,14 @@ def _watchdog_tick():
         loop = r.get('playlist_loop', [])
         track_key = (loop[0].get('url') or loop[0].get('id')) if loop else None
 
+        # Elapsed vid senast BEKRÄFTADE framsteg — inte förra varvet (13 okt 2026). Linn i
+        # vardagsrummet (UPnP-bryggan, flow-läge) rapporterar tiden ryckvis: den står still
+        # 3–9 s och hoppar sedan ikapp (uppmätt 61,8 → 64,9 → 65,0 … → 74,0). Jämfört varv
+        # för varv gav det tre varv i rad under _MIN_PROGRESS_S mitt i en spelande låt, och
+        # vakthunden hoppade till nästa (Luther Vandross vid 202 av 230 s, Heatwave vid 250
+        # av 303 s m.fl.). Mot senaste framsteget räknas ikapphoppet; en krypning vid
+        # låtslut (252 → 252,8) når aldrig upp till tröskeln och fångas som förut.
         prev_elapsed = _last_elapsed.get(mac)
-        _last_elapsed[mac] = elapsed
         # Paus/stopp → play (återupptagen, samma spår) = färsk frist. Annars räknades
         # pausen som lås: 8 okt 2026 "C5 låst 541s" → stop→play + hopp en sekund efter
         # att man tryckt play.
@@ -951,7 +982,32 @@ def _watchdog_tick():
         past_end = duration > 0 and elapsed > duration + _PAST_END_MARGIN_S
         making_progress = mode == 'play' and not past_end and (
             prev_elapsed is None or elapsed - prev_elapsed >= _MIN_PROGRESS_S)
+        if (making_progress or prev_elapsed is None or elapsed < prev_elapsed
+                or track_changed or resumed):
+            _last_elapsed[mac] = elapsed          # ny baslinje (backning = sökning/nytt spår)
 
+        # Trovärdig position: rimlig ökning (eller backning/nytt spår) flyttar den, ett hopp
+        # längre än väggtiden gör det inte förrän nästa rimliga steg därifrån.
+        tp = _trusted_pos.get(mac)
+        if tp is None or track_changed or resumed or mode != 'play' or elapsed < tp[0]:
+            _trusted_pos[mac] = (elapsed, now)
+        elif elapsed - tp[0] < _MIN_PROGRESS_S:
+            pass                                  # står still/kryper: positionen och dess tid står kvar
+        elif elapsed - tp[0] <= (now - tp[1]) + _JUMP_TOLERANCE_S:
+            _trusted_pos[mac] = (elapsed, now)
+        elif _jump_seen.get(mac) is not None and elapsed - _jump_seen[mac][0] >= _MIN_PROGRESS_S:
+            _trusted_pos[mac] = (elapsed, now)    # sökning: tiden går vidare efter hoppet
+        if _trusted_pos[mac][1] == now or elapsed - _trusted_pos[mac][0] < _MIN_PROGRESS_S:
+            _jump_seen.pop(mac, None)
+        elif _jump_seen.get(mac) is None or elapsed < _jump_seen[mac][0]:
+            _jump_seen[mac] = (elapsed, now)
+
+        if mac in _shadow_since and (making_progress or track_changed or resumed or mode != 'play'):
+            t0, what, el0, tr0 = _shadow_since.pop(mac)
+            how = ("spårbyte" if track_changed else "framsteg" if making_progress
+                   else "återupptagen" if resumed else f"läge {mode}")
+            logging.info(f"[watchdog] SKUGGA {name}: löste sig själv efter {now - t0:.0f} s ({how}) "
+                         f"— skulle ha gjort {what} vid {el0:.0f} s")
         if making_progress:
             _last_active_ts[mac] = now
             _skip_recover.pop(mac, None)
@@ -993,7 +1049,28 @@ def _watchdog_tick():
         # → färsk frist, så nästa spår får egen _LOCK_SKIP_SECONDS-frist.
         cur_index = int(_num(r.get('playlist_cur_index')))
         has_next  = cur_index < playlist_tracks - 1
-        if is_lock and has_next and frozen_for >= _LOCK_SKIP_SECONDS:
+        at_end = duration > 0 and elapsed >= duration - _AT_END_MARGIN_S
+        skip_after = _END_STALL_SKIP_S if at_end else _LOCK_SKIP_SECONDS
+        if at_end and is_lock:
+            # Kan låten verkligen vara slut? Annars vänta ut den verkliga längden.
+            t_el, t_ts = _trusted_pos.get(mac, (elapsed, now))
+            real_end = t_ts + max(0.0, duration - t_el)
+            if now < real_end + _END_STALL_SKIP_S:
+                if not _false_end_logged.get(mac):
+                    logging.info(f"[watchdog] {name} säger slut ({elapsed:.0f}/{duration:.0f} s) men "
+                                 f"trovärdig position är {t_el + (now - t_ts):.0f} s — väntar ut låten")
+                    _false_end_logged[mac] = True
+                continue
+        _false_end_logged.pop(mac, None)
+        if is_lock and mac.lower() in _SHADOW_MACS and frozen_for >= min(skip_after, _LOCK_KILL_SECONDS):
+            if mac not in _shadow_since:
+                what = "hopp" if has_next else "stop + rensa"
+                _shadow_since[mac] = (now - frozen_for, what, elapsed, track_key)
+                logging.info(f"[watchdog] SKUGGA {name}: står still {int(frozen_for)}s vid {elapsed:.0f}/{duration:.0f} s "
+                             f"på spår {cur_index + 1}/{playlist_tracks} — skulle ha gjort {what}, gör inget")
+                _record_lock_event(p, r, event="shadow", froze_at=elapsed, frozen_for=int(frozen_for))
+            continue
+        if is_lock and has_next and frozen_for >= skip_after:
             n = _skip_recover.get(mac, 0)
             if n < _LOCK_SKIP_MAX:
                 logging.info(
@@ -1025,6 +1102,7 @@ def _watchdog_tick():
             _last_elapsed.pop(mac, None)
             _last_track.pop(mac, None)
             _skip_recover.pop(mac, None)
+            _trusted_pos.pop(mac, None)
 
     # Glöm spelare som försvunnit (avstängda) så dictarna inte växer obegränsat.
     for mac in list(_last_active_ts.keys()):
@@ -1033,6 +1111,9 @@ def _watchdog_tick():
             _last_elapsed.pop(mac, None)
             _last_track.pop(mac, None)
             _skip_recover.pop(mac, None)
+            _trusted_pos.pop(mac, None)
+            _jump_seen.pop(mac, None)
+            _shadow_since.pop(mac, None)
 
 
 def _watchdog_loop():

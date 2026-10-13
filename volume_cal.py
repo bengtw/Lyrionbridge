@@ -43,8 +43,11 @@ ett omätt rum ska sakna post, och då lämnas volymen i fred i stället för at
 CALIBRATION = {
     # Köket, Audio Pro C5 — referensskalan, alltså identitet
     "bb:bb:7a:f8:33:39": [(18, 18), (38, 38), (60, 60)],
-    # Vardagsrummet, Linn Majik DSM
+    # Vardagsrummet, Linn Majik DSM — via UPnP-bryggan (till 13 okt 2026)
     "bb:bb:4d:b0:d0:06": [(26, 18), (35, 38), (49, 60)],
+    # Vardagsrummet, Linn Majik DSM via linnstream (från 13 okt 2026): samma Linn och samma
+    # mappning (Lyrions volym → Linns volym 1:1), alltså samma mätpunkter.
+    "02:4c:49:4e:4e:01": [(26, 18), (35, 38), (49, 60)],
     # Kontoret, squeezelite på Pi — kraftigt ojämn skala, se modulens docstring
     "b8:27:eb:fb:30:d9": [(14, 18), (21, 38), (38, 60)],
     # badrummet (b8:27:eb:f5:54:ad) är INTE mätt.
