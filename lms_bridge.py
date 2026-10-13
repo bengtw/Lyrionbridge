@@ -582,25 +582,26 @@ def _deferred_kick(player_mac, delay=5.0, attempts=4):
                 frozen_kicks += 1
     threading.Thread(target=_kick, daemon=True).start()
 
+# Ingen shuffle (13 okt 2026). Den infördes när Daily Mix var det enda knapparna nådde, för
+# att det inte skulle bli samma ordning varje gång. Nu ska det som spelas vara det som visas
+# (dashboardens låtlista, "starta från den här låten"), och Spotify har redan ordnat mixarna.
+# Shuffle stängs uttryckligen av: en spelare minns läget från förra kön.
+
 def lms_play_stream(player_mac, play_command):
-    """stop → clear → play → shuffle on (för URLs och daily mixes)"""
+    """shuffle av → stop → clear → play (för URLs och daily mixes)"""
+    lms_json_rpc(player_mac, ["playlist", "shuffle", 0])
     lms_json_rpc(player_mac, ["stop"])
     lms_json_rpc(player_mac, ["playlist", "clear"])
     result = lms_json_rpc(player_mac, play_command)
-    lms_json_rpc(player_mac, ["playlist", "shuffle", 1])
     _deferred_kick(player_mac)
     return result
 
 def lms_play_playlist(player_mac, url):
-    """Spotify playlist: shuffle off → stop → clear → play → vänta på Spotty → shuffle on → skip → play"""
+    """Spotify playlist: shuffle av → stop → clear → play, i spellistans ordning."""
     lms_json_rpc(player_mac, ["playlist", "shuffle", 0])
     lms_json_rpc(player_mac, ["stop"])
     lms_json_rpc(player_mac, ["playlist", "clear"])
     res = lms_json_rpc(player_mac, ["playlist", "play", url])
-    time.sleep(2.0)
-    lms_json_rpc(player_mac, ["playlist", "shuffle", 1])
-    lms_json_rpc(player_mac, ["playlist", "index", "+1"])
-    lms_json_rpc(player_mac, ["play"])
     _deferred_kick(player_mac)
     return res
 
@@ -1192,7 +1193,7 @@ def play_url():
         lms_json_rpc(player_mac, ["playlist", "shuffle", 0])
         res = lms_load_album(player_mac, clean_url)
 
-    # --- SPELLISTOR: Shuffle PÅ, vänta på att Spotty laddar kön ---
+    # --- SPELLISTOR: i spellistans ordning (ingen shuffle sedan 13 okt) ---
     elif "spotify:playlist:" in clean_url:
         res = lms_play_playlist(player_mac, clean_url)
         _mark_queue_origin(player_mac, "spotify_playlist")
