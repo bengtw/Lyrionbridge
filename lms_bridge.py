@@ -39,9 +39,12 @@ logging.getLogger('werkzeug').setLevel(logging.ERROR)
 _session = requests.Session()
 _session.mount('http://', requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=10))
 
+# Spottys sökmeny: 0 Artists, 1 Albums, 2 Playlists, 3 Podcasts, 4 Podcast Episodes,
+# 5 Users, sedan låtarna direkt (isaudio=1). "track" stod förut på 1 (= Albums) och
+# album saknades — låtsöket använder inte tabellen, så felet syntes inte (13 okt 2026).
 CATEGORY_INDEX = {
     "artist":   0,
-    "track":    1,
+    "album":    1,
     "playlist": 2,
     "podcast":  3,
     "episode":  4,
@@ -696,11 +699,15 @@ def _format_track(item, stable_uri=None):
         else:
             artist = rest
 
+    raw_img = item.get('image', '')
+    m = re.search(r'/imageproxy/([^/]+)/image', raw_img)
     return {
         "name": title.strip(),
         "subtitle": f"{artist.strip()} — {album.strip()}".strip(" —"),
         "uri": uri,
-        "art": _abs_image(item.get('image', '')),
+        "art": _abs_image(raw_img),
+        # Direkt CDN-URL (som _format_entry) — dashboarden på Edgars origin kan inte använda /imgproxy
+        "image_cdn": urllib.parse.unquote(m.group(1)) if m else (raw_img if raw_img.startswith('http') else ''),
     }
 
 
@@ -2076,6 +2083,75 @@ def spotify_artist_top():
     tracks_res = lms_json_rpc(player_mac, ["spotty", "items", 0, 10, f"item_id:{top_item['id']}"], timeout=_spotty)
     items = tracks_res.get('result', {}).get('loop_loop', []) if tracks_res else []
     return jsonify([_format_track(it) for it in items if it.get('isaudio')])
+
+# ── Spotify-album (dashboardens sök, 13 okt 2026) ─────────────────────────────
+# Spotty ger inga stabila album-URI:er, bara positionsberoende item_id
+# (1.0_<sökterm>.1.N). Albumet identifieras därför med titel + artist, och varje
+# uppspelning gör en FÄRSK sökning och kontrollerar namnet innan den spelar — ett
+# cachat id kan inte spela fel album om Spotify ändrat ordningen.
+
+def _album_norm(s):
+    return re.sub(r"\W+", " ", (s or "").lower()).strip()
+
+
+def _find_spotify_album(player_mac, title, artist):
+    """Färsk Spotty-sökning på "<titel> <artist>" → (item_id, Spottys albumtitel) för
+    albumet vars namn stämmer, annars (None, None)."""
+    query = f"{title} {artist}".strip()
+    encoded = urllib.parse.quote(query)
+    with _spotty_sem:
+        lms_json_rpc(player_mac, ["spotty", "items", 0, 1, "item_id:1.0", f"search:{query}"], timeout=35)
+        sub = lms_json_rpc(player_mac, ["spotty", "items", 0, 20, f"item_id:1.0_{encoded}.1"], timeout=35)
+    want_t, want_a = _album_norm(title), _album_norm(artist)
+    for it in (sub or {}).get('result', {}).get('loop_loop', []):
+        name = it.get('name', '')
+        t, _, a = name.rpartition(' by ')
+        if not t:
+            t, a = name, ""
+        if _album_norm(t) == want_t and (not want_a or want_a in _album_norm(a) or _album_norm(a) in want_a):
+            return it.get('id'), t
+    return None, None
+
+
+@app.route('/spotify_album_tracks')
+def spotify_album_tracks():
+    """Låtarna i ett Spotify-album: title=, artist=. [{title, artist}] i albumets ordning."""
+    title, artist = request.args.get('title', '').strip(), request.args.get('artist', '').strip()
+    if not title:
+        return jsonify({"error": "Missing title"}), 400
+    player_mac = _any_player_mac()
+    item_id, spotty_title = _find_spotify_album(player_mac, title, artist)
+    if not item_id:
+        return jsonify({"error": "Albumet hittades inte på Spotify"}), 404
+    with _spotty_sem:
+        res = lms_json_rpc(player_mac, ["spotty", "items", 0, 100, f"item_id:{item_id}"], timeout=35)
+    tracks = []
+    suffix = f" from {spotty_title}".lower()   # Spottys stavning ("Songs From The Big Chair")
+    for it in (res or {}).get('result', {}).get('loop_loop', []):
+        if not it.get('isaudio'):
+            continue
+        # "3. Appetite - 2007 Remastered Version by Prefab Sprout from Steve McQueen"
+        name = re.sub(r"^\d+\.\s*", "", it.get('name', ''))
+        if name.lower().endswith(suffix):
+            name = name[:-len(suffix)]
+        t, _, a = name.rpartition(' by ')
+        tracks.append({"title": (t or name).strip(), "artist": (a if t else "").strip()})
+    return jsonify(tracks)
+
+
+@app.route('/play_spotify_album')
+def play_spotify_album():
+    """Spelar ett Spotify-album: title=, artist=, room=. Färsk sökning + namnkontroll."""
+    title, artist = request.args.get('title', '').strip(), request.args.get('artist', '').strip()
+    player_mac, _ = get_player_info(request.args.get('room'))
+    if not (player_mac and title):
+        return jsonify({"error": "Missing title or room"}), 400
+    item_id, _ = _find_spotify_album(player_mac, title, artist)
+    if not item_id:
+        return jsonify({"error": "Albumet hittades inte på Spotify"}), 404
+    lms_play_stream(player_mac, ["spotty", "playlist", "play", f"item_id:{item_id}"])
+    return jsonify({"status": "ok", "item_id": item_id})
+
 
 @app.route('/spotify_artist_radio')
 def spotify_artist_radio():
