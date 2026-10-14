@@ -86,7 +86,7 @@ READS = [
 # de täcks av OPTIONS-kontrollen. Kontrollen nedan säger till om en ny väg dyker upp som
 # varken läses eller står här.
 NOT_CALLED = {
-    "/button", "/cache_resolved", "/daily", "/deck_play_pause", "/delete_plays",
+    "/button", "/cache_resolved", "/daily", "/delete_plays",
     "/imgproxy", "/get_artist_albums", "/spotify_genre_playlists", "/like_track", "/lms", "/love_track",
     "/mark_origin", "/mark_queue_origin", "/next", "/pause", "/play", "/play_album",
     "/play_artist_random", "/play_radio", "/play_random_album", "/play_spotify_album", "/play_url",

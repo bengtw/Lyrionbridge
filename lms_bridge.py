@@ -3138,15 +3138,6 @@ def love_track():
                     "loved_rows": loved_rows, "lastfm": lastfm})
 
 
-@app.route('/deck_play_pause')
-def deck_play_pause():
-    """Play/paus-växling i kontoret — Pi:ns F3-tangent (edgar_client._deck_play_pause)."""
-    mac, name = get_player_info("kontoret")
-    if not mac:
-        return jsonify({"error": f"Hittade inte kontoret"}), 404
-    transport(mac, "toggle")
-    return jsonify({"action": "toggle", "player": name})
-
 
 @app.route('/skip_track')
 def skip_track():
