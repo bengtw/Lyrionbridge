@@ -15,3 +15,6 @@ __pycache__/
 *.db-wal
 *.db-shm
 *.db.bak-*
+
+# Ögonblicksbilden tas strax före en flytt (tools/snapshot.py), den versionshanteras inte
+tools/snapshot.json
