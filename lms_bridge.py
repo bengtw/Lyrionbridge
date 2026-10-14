@@ -378,18 +378,6 @@ def _abs_image(url):
         return _img_url(url)
     return url
 
-def _act_on_active(command_fn):
-    """Kör command_fn(mac) på alla spelare som för tillfället spelar. Returnerar berörda rum."""
-    acted = []
-    for p in get_all_players():
-        mac = p.get('playerid')
-        if not mac:
-            continue
-        res = lms_json_rpc(mac, ["status", "-", "1"])
-        if res and res.get('result', {}).get('mode') == 'play':
-            command_fn(mac)
-            acted.append(p.get('name'))
-    return acted
 
 def c5_transport_state(timeout=2):
     """C5:ans EGEN transportstatus via UPnP: 'PLAYING', 'STOPPED', 'TRANSITIONING' …
@@ -1971,22 +1959,6 @@ def transfer_playback():
         _deferred_kick(to_mac)
     return "OK"
 
-@app.route('/c5_discover')
-def c5_discover():
-    """Hämtar UPnP device description från C5 för att hitta rätt service-URL."""
-    if not DEBUG:
-        return "Not available", 403
-    results = {}
-    for port in [49152, 1400, 8080, 80]:
-        try:
-            r = _session.get(f"http://{C5_IP}:{port}/description.xml", timeout=2)
-            if r.status_code == 200:
-                results[f"port_{port}"] = r.text[:5000]
-                break
-        except Exception as e:
-            results[f"port_{port}"] = str(e)
-    return jsonify(results)
-
 
 @app.route('/spotify_search')
 def spotify_search():
@@ -2103,20 +2075,6 @@ def resolve_player_endpoint():
     return jsonify({"error": f"Hittade inte spelaren '{name}'"})
 
 
-@app.route('/stop_active')
-def stop_active():
-    """PAUSAR alla spelare som spelar (trots namnet — ett äldre gränssnitt; samma som
-    /pause utan rum). Ingen känd anropare i koden 12 okt 2026, därför loggas avsändaren."""
-    logging.info(f"[transport] /stop_active från {request.remote_addr}")
-    stopped = [name for mac, name in _active_macs(include_paused=False) if transport(mac, "pause")]
-    return jsonify({'stopped': stopped})
-
-
-@app.route('/next_active')
-def next_active():
-    """Hoppar till nästa låt på den spelare som spelar."""
-    acted = _act_on_active(lambda mac: lms_json_rpc(mac, ["playlist", "index", "+1"]))
-    return jsonify({'next': acted})
 
 def _resolve_spotify_artist_id(player_mac, query, timeout=35):
     """Söker en artist via Spotty och borrar ner till dess stabila artist-item_id.
@@ -2412,52 +2370,6 @@ def lastfm_artist_tags():
     return jsonify({"artist": artist, "tags": tags})
 
 
-@app.route('/lastfm_tag_artists')
-def lastfm_tag_artists():
-    """Toppkonstnärer för en Last.fm-tagg (genre/stämning)."""
-    tag = request.args.get('tag', '').strip()
-    if not tag:
-        return jsonify({"error": "tag saknas"}), 400
-    try:
-        limit = min(int(request.args.get('limit', '10')), 30)
-    except ValueError:
-        limit = 10
-    cached = _search_cache_get(tag, "lastfm_tag_artists", limit)
-    if cached is not None:
-        return jsonify({"tag": tag, "artists": cached, "cached": True})
-    resp = _lastfm_get("tag.getTopArtists", tag=tag, limit=limit)
-    if not resp or "topartists" not in resp:
-        return jsonify({"tag": tag, "artists": []})
-    artists = [
-        {"name": a.get("name", ""), "rank": int(a.get("@attr", {}).get("rank", 0))}
-        for a in resp["topartists"].get("artist", [])
-    ]
-    _search_cache_set(tag, "lastfm_tag_artists", limit, artists)
-    return jsonify({"tag": tag, "artists": artists})
-
-@app.route('/lastfm_tag_tracks')
-def lastfm_tag_tracks():
-    """Topplåtar för en Last.fm-tagg (genre/stämning)."""
-    tag = request.args.get('tag', '').strip()
-    if not tag:
-        return jsonify({"error": "tag saknas"}), 400
-    try:
-        limit = min(int(request.args.get('limit', '15')), 30)
-    except ValueError:
-        limit = 15
-    cached = _search_cache_get(tag, "lastfm_tag_tracks", limit)
-    if cached is not None:
-        return jsonify({"tag": tag, "tracks": cached, "cached": True})
-    resp = _lastfm_get("tag.getTopTracks", tag=tag, limit=limit)
-    if not resp or "tracks" not in resp:
-        return jsonify({"tag": tag, "tracks": []})
-    tracks = [
-        {"artist": t.get("artist", {}).get("name", ""), "title": t.get("name", "")}
-        for t in resp["tracks"].get("track", [])
-        if t.get("artist", {}).get("name") and t.get("name")
-    ]
-    _search_cache_set(tag, "lastfm_tag_tracks", limit, tracks)
-    return jsonify({"tag": tag, "tracks": tracks})
 
 @app.route('/lastfm_similar')
 def lastfm_similar():
@@ -2524,36 +2436,6 @@ def lastfm_profile():
         return jsonify({"error": "LASTFM_API_KEY eller LASTFM_USERNAME saknas"}), 503
     return jsonify(taste)
 
-@app.route('/spy')
-def spy():
-    if not DEBUG:
-        return "Not available", 403
-    player_mac = _any_player_mac()
-    return jsonify(lms_json_rpc(player_mac, ["spotty", "items", 0, 3, "item_id:0", "tags:asj"]))
-
-
-@app.route('/save_playlist', methods=['POST'])
-def save_playlist():
-    """Sparar en spellista som .m3u på NAS och ber LMS skanna om."""
-    data = request.get_json(force=True)
-    name = (data.get("name") or "").strip()
-    uris = data.get("uris", [])
-    if not name:
-        return jsonify({"error": "name saknas"}), 400
-    if not uris:
-        return jsonify({"error": "uris saknas"}), 400
-
-    safe_name = re.sub(r'[^\w\s\-åäöÅÄÖ]', '', name).strip()
-    path = os.path.join(PLAYLIST_DIR, f"{safe_name}.m3u")
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("#EXTM3U\n")
-            for uri in uris:
-                f.write(uri + "\n")
-        lms_json_rpc("", ["rescan", "playlists"])
-        return jsonify({"ok": True, "file": path, "tracks": len(uris)})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
 @app.route('/list_playlists_local')
 def list_playlists_local():
@@ -2676,14 +2558,6 @@ def skipped_tracks_endpoint():
     tracks = _lms_logger().skipped_tracks(limit=limit, days=days)
     return jsonify(tracks)
 
-
-@app.route('/listening_stats')
-def listening_stats_endpoint():
-    try:
-        days = int(request.args.get('days', 30))
-    except ValueError:
-        days = 30
-    return jsonify(_lms_logger().listening_stats(days=days))
 
 
 @app.route('/play_history_data')

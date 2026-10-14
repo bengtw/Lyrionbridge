@@ -62,14 +62,11 @@ READS = [
     ("senaste låtar", "/recent_tracks", {}, "shape"),
     ("skippade låtar", "/skipped_tracks", {}, "shape"),
     ("artistens spelningar", "/artist_plays", {"artist": "Sade"}, "shape"),
-    ("lyssningsstatistik", "/listening_stats", {}, "shape"),
     ("historikdata", "/play_history_data", {}, "shape"),
     ("lösta uri:er", "/resolved_uris", {}, "shape"),
     ("lastfm profil", "/lastfm_profile", {}, "shape"),
     ("lastfm liknande", "/lastfm_similar", {"artist": "Sade"}, "shape"),
     ("lastfm taggar", "/lastfm_artist_tags", {"artist": "Sade"}, "shape"),
-    ("lastfm taggartister", "/lastfm_tag_artists", {"tag": "jazz"}, "shape"),
-    ("lastfm tagglåtar", "/lastfm_tag_tracks", {"tag": "jazz"}, "shape"),
     ("lastfm rekommendationer", "/lastfm_recommendations", {}, "shape"),
     ("spotify rekommendationer", "/spotify_recommendations", {"artist": "Sade"}, "shape"),
     # Spotty — en i taget
@@ -89,12 +86,12 @@ READS = [
 # de täcks av OPTIONS-kontrollen. Kontrollen nedan säger till om en ny väg dyker upp som
 # varken läses eller står här.
 NOT_CALLED = {
-    "/button", "/c5_discover", "/cache_resolved", "/daily", "/deck_play_pause", "/delete_plays",
+    "/button", "/cache_resolved", "/daily", "/deck_play_pause", "/delete_plays",
     "/imgproxy", "/get_artist_albums", "/spotify_genre_playlists", "/like_track", "/lms", "/love_track",
-    "/mark_origin", "/mark_queue_origin", "/next", "/next_active", "/pause", "/play", "/play_album",
+    "/mark_origin", "/mark_queue_origin", "/next", "/pause", "/play", "/play_album",
     "/play_artist_random", "/play_radio", "/play_random_album", "/play_spotify_album", "/play_url",
-    "/queue-tracks", "/save_playlist", "/set_volume", "/skip_track", "/spotify/ingest", "/spy",
-    "/stop", "/stop_active", "/toggle_play_pause", "/transfer",
+    "/queue-tracks", "/set_volume", "/skip_track", "/spotify/ingest",
+    "/stop", "/toggle_play_pause", "/transfer",
 }
 
 

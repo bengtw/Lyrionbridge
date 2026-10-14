@@ -67,14 +67,5 @@ class TransportTest(unittest.TestCase):
         self.assertEqual(sent, [(VARD, ["stop"]), (BAD, ["stop"])])
         self.assertEqual(body["acted"], ["Vardagsrum", "Badrum"])
 
-    def test_stop_active_still_pauses(self):
-        fake = FakeLMS({VARD: "play", KONT: "pause"})
-        with mock.patch.object(lb, "lms_json_rpc", fake), \
-             mock.patch.object(lb, "get_all_players", lambda: PLAYERS):
-            body = lb.app.test_client().get("/stop_active").get_json()
-        self.assertEqual(fake.sent, [(VARD, ["pause", "1"])])
-        self.assertEqual(body["stopped"], ["Vardagsrum"])
-
-
 if __name__ == "__main__":
     unittest.main()
