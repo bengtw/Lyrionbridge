@@ -2165,6 +2165,67 @@ def spotify_artist_top():
     items = tracks_res.get('result', {}).get('loop_loop', []) if tracks_res else []
     return jsonify([_format_track(it) for it in items if it.get('isaudio')])
 
+# ── Artistens katalog (Edgars titelrättning, 14 okt 2026) ─────────────────────
+# Toppspåren gav titelrättningen bara hits: en påhittad titel blev artistens mest spelade
+# låt ("Jim Tomlinson – So Maco" → "So Nice"). Upptäckter ska inte styras av Spotifys
+# popularitet (användaren), så katalogen tar också albumen och singlarna. Ett anrop per
+# album → svaret sparas i ett dygn, och Spotty får högst _spotty_sem frågor åt gången.
+_catalog_cache: dict = {}
+_CATALOG_TTL = 86400
+_TRACK_NO_RE = re.compile(r"^\d+\.\s+")
+
+
+def _spotty_items(player_mac, item_id, limit, timeout=35):
+    with _spotty_sem:
+        res = lms_json_rpc(player_mac, ["spotty", "items", 0, limit, f"item_id:{item_id}"], timeout=timeout)
+    return res.get('result', {}).get('loop_loop', []) if res else []
+
+
+@app.route('/spotify_artist_catalog')
+def spotify_artist_catalog():
+    """Artistens låtar: toppspår + album (högst ?albums=8) + singlar/EP (högst ?singles=6),
+    i formatet från /spotify_artist_top ({name, subtitle, …}), utan dubbletter."""
+    query = request.args.get('q', '').strip()
+    if not query:
+        return jsonify({"error": "Missing q"}), 400
+    n_albums = min(int(request.args.get('albums', 8)), 20)
+    n_singles = min(int(request.args.get('singles', 6)), 20)
+    key = (query.lower(), n_albums, n_singles)
+    hit = _catalog_cache.get(key)
+    if hit and time.time() - hit[0] < _CATALOG_TTL:
+        return jsonify(hit[1])
+    player_mac, _ = get_player_info(request.args.get('room'))
+    with _spotty_sem:
+        artist_id, err = _resolve_spotify_artist_id(player_mac, query, 35)
+    if err:
+        return err
+    menu = _spotty_items(player_mac, artist_id, 10)
+    by_name = {it.get('name', ''): it for it in menu}
+    out, seen = [], set()
+
+    def add(items):
+        for it in items:
+            if not it.get('isaudio') or it.get('hasitems'):
+                continue
+            t = _format_track(dict(it, name=_TRACK_NO_RE.sub("", it.get('name', ''))))
+            k = t['name'].lower()
+            if t['name'] and k not in seen:
+                seen.add(k)
+                out.append(t)
+
+    top = next((it for n, it in by_name.items() if any(w in n for w in ("Top", "Populär", "Popular"))), None)
+    if top:
+        add(_spotty_items(player_mac, top['id'], 10))
+    for label, n in (("Albums", n_albums), ("Singles", n_singles)):
+        sec = next((it for nm, it in by_name.items() if nm.startswith(label)), None)
+        if not sec or not n:
+            continue
+        for alb in _spotty_items(player_mac, sec['id'], n)[:n]:
+            add(_spotty_items(player_mac, alb['id'], 50))
+    _catalog_cache[key] = (time.time(), out)
+    return jsonify(out)
+
+
 # ── Spotify-album (dashboardens sök, 13 okt 2026) ─────────────────────────────
 # Spotty ger inga stabila album-URI:er, bara positionsberoende item_id
 # (1.0_<sökterm>.1.N). Albumet identifieras därför med titel + artist, och varje
