@@ -2173,6 +2173,17 @@ def spotify_artist_top():
 _catalog_cache: dict = {}
 _CATALOG_TTL = 86400
 _TRACK_NO_RE = re.compile(r"^\d+\.\s+")
+# Livealbum, liveversioner och remixer är dåliga ersättare för en studiolåt (Depeche Modes
+# åtta senaste "album" var livealbum, och "Remixes 81>04" kom med).
+_LIVE_RE = re.compile(r"\blive\b|\bunplugged\b|in concert|\bremix(es)?\b|\bmixes\b", re.I)
+
+
+def _spread(items, n):
+    """n poster jämnt fördelade över listan (hela karriären, inte bara de senaste)."""
+    if len(items) <= n:
+        return items
+    step = len(items) / n
+    return [items[int(i * step)] for i in range(n)]
 
 
 def _spotty_items(player_mac, item_id, limit, timeout=35):
@@ -2184,7 +2195,8 @@ def _spotty_items(player_mac, item_id, limit, timeout=35):
 @app.route('/spotify_artist_catalog')
 def spotify_artist_catalog():
     """Artistens låtar: toppspår + album (högst ?albums=8) + singlar/EP (högst ?singles=6),
-    i formatet från /spotify_artist_top ({name, subtitle, …}), utan dubbletter."""
+    i formatet från /spotify_artist_top ({name, subtitle, …}), utan dubbletter. Livealbum
+    och liveversioner hoppas över, och albumen sprids över hela karriären."""
     query = request.args.get('q', '').strip()
     if not query:
         return jsonify({"error": "Missing q"}), 400
@@ -2205,11 +2217,11 @@ def spotify_artist_catalog():
 
     def add(items):
         for it in items:
-            if not it.get('isaudio') or it.get('hasitems'):
+            if not it.get('isaudio'):   # även låtar har hasitems=1 i Spotty — läs bara låtlistor hit
                 continue
             t = _format_track(dict(it, name=_TRACK_NO_RE.sub("", it.get('name', ''))))
             k = t['name'].lower()
-            if t['name'] and k not in seen:
+            if t['name'] and k not in seen and not _LIVE_RE.search(t['name']):
                 seen.add(k)
                 out.append(t)
 
@@ -2220,7 +2232,9 @@ def spotify_artist_catalog():
         sec = next((it for nm, it in by_name.items() if nm.startswith(label)), None)
         if not sec or not n:
             continue
-        for alb in _spotty_items(player_mac, sec['id'], n)[:n]:
+        albums = [al for al in _spotty_items(player_mac, sec['id'], 100)
+                  if not _LIVE_RE.search((al.get('name') or '').split(' by ')[0])]
+        for alb in _spread(albums, n):
             add(_spotty_items(player_mac, alb['id'], 50))
     _catalog_cache[key] = (time.time(), out)
     return jsonify(out)
