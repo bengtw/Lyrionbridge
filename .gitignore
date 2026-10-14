@@ -18,3 +18,7 @@ __pycache__/
 
 # Ögonblicksbilden tas strax före en flytt (tools/snapshot.py), den versionshanteras inte
 tools/snapshot.json
+
+# Privata nycklar och mkcert ligger i ~/.edgar/certs/bridge/ sedan 14 okt 2026
+certs/
+mkcert

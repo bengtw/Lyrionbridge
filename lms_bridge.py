@@ -3297,7 +3297,8 @@ if __name__ == '__main__':
 
     logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
-    _certs = os.path.join(os.path.dirname(__file__), 'certs')
+    # Certifikaten ligger utanför repot sedan 14 okt 2026 (privata nycklar hör inte hemma i git).
+    _certs = os.getenv("BRIDGE_CERT_DIR", os.path.expanduser("~/.edgar/certs/bridge"))
     cert = os.getenv("BRIDGE_CERT", os.path.join(_certs, '10.0.1.132+2.pem'))
     key  = os.getenv("BRIDGE_KEY",  os.path.join(_certs, '10.0.1.132+2-key.pem'))
 
