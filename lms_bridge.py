@@ -3080,6 +3080,39 @@ def like_track():
     return jsonify({"artist": artist, "title": title, "lastfm": lfm_ok, "db": db_ok})
 
 
+@app.route('/mark_current_choice', methods=['POST'])
+def mark_current_choice():
+    """{room}: låten som spelar blir ett eget val (origin 'manual', 3× smakvikt).
+    Edgar Musiks "mixa vidare" på låten som redan spelar (15 okt 2026, användarens beslut):
+    att mixa från en låt är ett aktivt val, som att välja den ur en lista. Spelningen hade
+    redan loggats med ett annat ursprung (DJ, graf, Daily Mix …), så raden märks om i
+    efterhand. Egna val och mobilens spelningar rörs inte."""
+    data = request.get_json(silent=True) or {}
+    mac, name = get_player_info(data.get("room"))
+    if not mac:
+        return jsonify({"error": "Okänt rum"}), 404
+    try:
+        res = lms_json_rpc(mac, ["status", "-", "1", "tags:a"])
+        track = ((res or {}).get("result", {}).get("playlist_loop") or [{}])[0]
+        artist, title = (track.get("artist") or "").strip(), (track.get("title") or "").strip()
+    except Exception as e:
+        return jsonify({"error": f"Kunde inte hämta låtinfo: {e}"}), 500
+    if not artist or not title:
+        return jsonify({"error": "Ingen låt spelar"}), 404
+    with sqlite3.connect(PLAY_DB, timeout=10) as conn:
+        row = conn.execute(
+            "SELECT id, origin FROM plays WHERE lower(player)=lower(?) AND lower(artist)=lower(?) "
+            "AND lower(title)=lower(?) AND ts > strftime('%s','now') - 7200 ORDER BY ts DESC LIMIT 1",
+            (name, artist, title)).fetchone()
+        if not row:
+            return jsonify({"ok": False, "error": "Spelningen finns inte i historiken än"}), 404
+        if row[1] in ("manual", "spotify_mobile"):
+            return jsonify({"ok": True, "changed": False, "origin": row[1]})
+        conn.execute("UPDATE plays SET origin='manual' WHERE id=?", (row[0],))
+    logging.info("[val] %s – %s i %s: %s → manual (mixa vidare)", artist, title, name, row[1])
+    return jsonify({"ok": True, "changed": True, "was": row[1]})
+
+
 @app.route('/love_track', methods=['POST'])
 def love_track():
     """Gillar ett spår som INTE spelas just nu: Last.fm love + loved=1 i plays.
