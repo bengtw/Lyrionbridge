@@ -67,8 +67,10 @@ C5_MAC       = os.getenv("C5_MAC", "bb:bb:7a:f8:33:39")
 # som står på 0 i 6–9 s under en normal start och kan ticka vidare när C5 tystnat.
 C5_COLD_AFTER_S   = 30 * 60   # tyst så här länge → nästa start räknas som kallstart
 C5_WAKE_MAX_S     = 6.0       # väckning före play: vänta högst så här länge på svar
-C5_START_RETRY_S  = 20.0      # inte PLAYING så här länge efter play → stop→play
-C5_START_SKIP_S   = 35.0      # … fortfarande inte → hoppa till nästa spår
+# 16 okt 2026: 7 av ~45 starter sedan 8 okt fastnade i TRANSITIONING och löste sig ALDRIG själva
+# (stop→play vid 20 s, PLAYING 2 s senare); lyckade starter ger PLAYING efter 1–6 s (längst 12 s).
+C5_START_RETRY_S  = 8.0       # inte PLAYING så här länge efter play → stop→play (var 20)
+C5_START_SKIP_S   = 20.0      # … fortfarande inte → hoppa till nästa spår (var 35)
 C5_DESYNC_S       = 20.0      # LMS spelar men C5 STOPPED så här länge → logga (skuggläge)
 PLAYLIST_DIR = os.getenv("LMS_PLAYLIST_DIR", "/var/lib/squeezeboxserver/playlists")
 DEBUG              = os.getenv("BRIDGE_DEBUG", "").lower() == "true"
