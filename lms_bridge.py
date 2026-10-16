@@ -69,8 +69,11 @@ C5_COLD_AFTER_S   = 30 * 60   # tyst så här länge → nästa start räknas so
 C5_WAKE_MAX_S     = 6.0       # väckning före play: vänta högst så här länge på svar
 # 16 okt 2026: 7 av ~45 starter sedan 8 okt fastnade i TRANSITIONING och löste sig ALDRIG själva
 # (stop→play vid 20 s, PLAYING 2 s senare); lyckade starter ger PLAYING efter 1–6 s (längst 12 s).
-C5_START_RETRY_S  = 8.0       # inte PLAYING så här länge efter play → stop→play (var 20)
-C5_START_SKIP_S   = 20.0      # … fortfarande inte → hoppa till nästa spår (var 35)
+# Prövat 8 s samma dag: en gång PLAYING efter 10 s, en gång låste sig Lyrion 12 s efter stoppet
+# (Spotify-strömmen laddade fortfarande) → 12 s tills vidare, och svarstiderna loggas.
+C5_START_RETRY_S  = 12.0      # inte PLAYING så här länge efter play → stop→play (var 20)
+C5_START_SKIP_S   = 12.0      # … fortfarande inte så här länge EFTER stop→play → nästa spår
+C5_GUARD_GIVEUP_S = 45.0      # Lyrion svarar inte alls så här länge → sluta bevaka
 C5_DESYNC_S       = 20.0      # LMS spelar men C5 STOPPED så här länge → logga (skuggläge)
 PLAYLIST_DIR = os.getenv("LMS_PLAYLIST_DIR", "/var/lib/squeezeboxserver/playlists")
 DEBUG              = os.getenv("BRIDGE_DEBUG", "").lower() == "true"
@@ -500,17 +503,29 @@ def c5_start_guard(mac, via):
 
 def _c5_start_guard(mac, via):
     """Efter en start: fråga C5 var 2:a s. PLAYING → klart (tiden loggas, kall/varm).
-    Inte PLAYING efter C5_START_RETRY_S → stop→play; efter C5_START_SKIP_S → nästa
-    spår. Avbryter om LMS inte längre spelar (man pausade/stoppade själv)."""
+    Inte PLAYING efter C5_START_RETRY_S → stop→play; C5_START_SKIP_S därefter → nästa
+    spår. Avbryter om LMS inte längre spelar (man pausade/stoppade själv) — men inte om Lyrion
+    bara inte svarar (då väntar den, högst C5_GUARD_GIVEUP_S)."""
     global _c5_last_playing, _c5_guard_running
-    retried = False
+    retried, t_retry, silent_since = False, None, None
     kind = f"{'kall' if _c5_start_cold else 'varm'} start ({via})"
     try:
         while True:
             time.sleep(2.0)
             t = time.time() - _c5_start_t0
             res = lms_json_rpc(mac, ["status", "-", 1, "tags:"], _raw=True)
-            if not res or res.get("result", {}).get("mode") != "play":
+            if not res:
+                # Inget svar ≠ stoppad (16 okt: Lyrion stod still 12 s efter stoppet, vakten gav upp
+                # och vaktens play utfördes först när Lyrion vaknade).
+                silent_since = silent_since or time.time()
+                if time.time() - silent_since >= C5_GUARD_GIVEUP_S:
+                    logging.info(f"[c5] {kind}: Lyrion har inte svarat på {C5_GUARD_GIVEUP_S:.0f} s — slutar bevaka")
+                    return
+                continue
+            if silent_since:
+                logging.info(f"[c5] {kind}: Lyrion svarade igen efter {time.time() - silent_since:.0f} s tystnad")
+                silent_since = None
+            if res.get("result", {}).get("mode") != "play":
                 logging.info(f"[c5] {kind}: LMS spelar inte längre efter {t:.0f} s — slutar bevaka")
                 return
             state = c5_transport_state()
@@ -519,11 +534,17 @@ def _c5_start_guard(mac, via):
                 logging.info(f"[c5] {kind}: PLAYING efter {t:.0f} s{' (efter stop→play)' if retried else ''}")
                 return
             if not retried and t >= C5_START_RETRY_S:
-                logging.info(f"[c5] {kind}: status={state} efter {t:.0f} s — stop→play")
-                lms_json_rpc(mac, ["stop"], _raw=True); time.sleep(0.3)
-                lms_json_rpc(mac, ["play"], _raw=True)
-                retried = True
-            elif retried and t >= C5_START_SKIP_S:
+                t1 = time.time()
+                r1 = lms_json_rpc(mac, ["stop"], _raw=True)
+                t2 = time.time()
+                time.sleep(0.3)
+                r2 = lms_json_rpc(mac, ["play"], _raw=True, timeout=15)
+                t3 = time.time()
+                logging.info(f"[c5] {kind}: status={state} efter {t:.0f} s — stop→play "
+                             f"(stop svarade {'på %.1f s' % (t2 - t1) if r1 else 'inte'}, "
+                             f"play {'på %.1f s' % (t3 - t2 - 0.3) if r2 else 'inte'})")
+                retried, t_retry = True, time.time()
+            elif retried and time.time() - t_retry >= C5_START_SKIP_S:
                 logging.info(f"[c5] {kind}: status={state} efter {t:.0f} s — hoppar till nästa spår")
                 lms_json_rpc(mac, ["playlist", "index", "+1"], _raw=True)
                 return
