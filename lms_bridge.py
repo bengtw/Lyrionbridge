@@ -490,12 +490,16 @@ _c5_start_cold    = False
 
 
 def c5_start_guard(mac, via):
-    """Starta startkontrollen (en åt gången). Ny start medan en kör → förnya fristen."""
+    """Starta startkontrollen (en åt gången). Ny start från bryggan medan en kör → förnya fristen.
+    Vakthundens upptäckt ("extern") förnyar inte: den ser samma start upp till 10 s senare, och
+    16 okt gjorde det att stop→play kom efter 22 s i stället för 12."""
     global _c5_guard_running, _c5_start_t0, _c5_start_cold
     with _c5_guard_lock:
-        _c5_start_t0 = time.time()
         if _c5_guard_running:
+            if via == "brygga":
+                _c5_start_t0 = time.time()
             return
+        _c5_start_t0 = time.time()
         _c5_start_cold = c5_is_cold()
         _c5_guard_running = True
     threading.Thread(target=_c5_start_guard, args=(mac, via), daemon=True).start()
