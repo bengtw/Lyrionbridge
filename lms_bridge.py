@@ -104,7 +104,11 @@ PLAY_DB            = Path(__file__).parent / "play_history.db"
 _SEARCH_CACHE_DB   = Path(__file__).parent / "metadata_cache.db"
 _SEARCH_TTL_TRACK  = 30 * 86400   # 30 dagar — spår ändras sällan
 _SEARCH_TTL_OTHER  = 7  * 86400   # 7 dagar  — album/artist/playlist
-_MIX_LABEL_TTL     = 6  * 3600    # 6 timmar — daily mixes byts ut dagligen
+# Daily Mix-etiketterna följer mixens INNEHÅLL, inte klockan (23 okt 2026): Spotify byter
+# en mix när som helst på dygnet, och med 6 h-TTL visade Daily Mix 3 "Soulig pop med
+# Lianne La Havas" i ~6 h medan Rob Zombie spelades. Nu jämförs mixens signatur
+# (_mix_sig) var 15:e minut och vid uppspelning; bara ändrade mixar får nya AI-anrop.
+_MIX_CHECK_INTERVAL = 15 * 60
 
 
 def _init_search_cache():
@@ -131,6 +135,8 @@ def _init_search_cache():
         cols = [r[1] for r in conn.execute("PRAGMA table_info(mix_labels)").fetchall()]
         if "summary" not in cols:
             conn.execute("ALTER TABLE mix_labels ADD COLUMN summary TEXT")
+        if "sig" not in cols:
+            conn.execute("ALTER TABLE mix_labels ADD COLUMN sig TEXT")
 
 
 _init_search_cache()
@@ -216,45 +222,75 @@ def _get_mix_summary(artists_text: str) -> str | None:
         return None
 
 
-def _refresh_mix_labels():
-    """Genererar AI-labels för Daily Mix 1–6 och cachar i DB. Körs i bakgrund."""
-    now = int(time.time())
-    stale_ids = set()
+_DAILY_IMG_RE = re.compile(r'/daily/\d+/([^/]+)/')
+_mix_refresh_lock = threading.Lock()
 
+
+def _image_cdn(raw_img: str) -> str:
+    m = re.search(r'/imageproxy/([^/]+)/image', raw_img)
+    return urllib.parse.unquote(m.group(1)) if m else (raw_img if raw_img.startswith('http') else '')
+
+
+def _daily_mix_index(title: str) -> int | None:
+    """0–5 för "Daily Mix 1"–"Daily Mix 6", annars None."""
+    if title.startswith('Daily Mix ') and len(title) == 11 and '1' <= title[10] <= '6':
+        return int(title[10]) - 1
+    return None
+
+
+def _mix_sig(item) -> str:
+    """Signatur för en mix innehåll: id:t i omslagets adress (pickasso …/daily/<n>/<id>/en,
+    byts när Spotify byter mixen) plus artistraden — samma omslag med nya artister räknas
+    också som byte."""
+    parts = item.get('text', '').split('\n')
+    m = _DAILY_IMG_RE.search(_image_cdn(item.get('icon') or item.get('image', '')))
+    return f"{m.group(1) if m else ''}|{parts[1] if len(parts) > 1 else ''}"
+
+
+def _mix_label_rows() -> dict:
+    """mix_id → (label, summary, sig, cached_at)."""
     with sqlite3.connect(_SEARCH_CACHE_DB) as conn:
-        rows = {r[0]: (r[1], r[2]) for r in conn.execute(
-            "SELECT mix_id, cached_at, summary FROM mix_labels"
+        return {r[0]: r[1:] for r in conn.execute(
+            "SELECT mix_id, label, summary, sig, cached_at FROM mix_labels"
         ).fetchall()}
-    for mix_id in range(6):
-        cached = rows.get(mix_id)
-        # Regenerera om saknas, utgången, saknar summering, ELLER om den cachade
-        # summeringen är för lång (>7 ord) — så gamla långa texter kortas vid omstart.
-        too_long = bool(cached and cached[1] and len(cached[1].split()) > 7)
-        if not cached or (now - cached[0]) > _MIX_LABEL_TTL or not cached[1] or too_long:
-            stale_ids.add(mix_id)
 
-    if not stale_ids:
+
+def _refresh_mix_labels(mixes_raw=None):
+    """Ny AI-etikett + summering för de Daily Mixar vars innehåll ändrats (eller som saknar
+    en). Oförändrade mixar rörs inte. En körning åt gången; en samtidig hoppar över."""
+    if not _mix_refresh_lock.acquire(blocking=False):
         return
+    try:
+        rows = _mix_label_rows()
+        for item in (mixes_raw if mixes_raw is not None else _fetch_daily_mixes_raw()):
+            parts = item.get('text', '').split('\n')
+            title = parts[0]
+            mix_id = _daily_mix_index(title)
+            if mix_id is None:
+                continue
+            sig = _mix_sig(item)
+            cached = rows.get(mix_id)
+            # Ny om saknas, utan summering, för lång (>7 ord) eller nytt innehåll.
+            if cached and cached[1] and len(cached[1].split()) <= 7 and cached[2] == sig:
+                continue
+            artists_text = parts[1] if len(parts) > 1 else title
+            label   = _get_mix_label(artists_text)
+            summary = _get_mix_summary(artists_text)
+            if label or summary:
+                with _db_lock, sqlite3.connect(_SEARCH_CACHE_DB) as conn:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO mix_labels (mix_id, label, summary, sig, cached_at) VALUES (?,?,?,?,?)",
+                        (mix_id, label or "", summary, sig, int(time.time()))
+                    )
+                why = "ny" if not cached else ("bytt innehåll" if cached[2] != sig else "omgjord")
+                logging.info(f"[mix_labels] {title} ({why}) → \"{label}\" / \"{summary}\"")
+    finally:
+        _mix_refresh_lock.release()
 
-    mixes_raw = _fetch_daily_mixes_raw()
-    for item in mixes_raw:
-        parts = item.get('text', '').split('\n')
-        title = parts[0]
-        if not (title.startswith('Daily Mix ') and len(title) == 11 and '1' <= title[10] <= '6'):
-            continue
-        mix_id = int(title[10]) - 1
-        if mix_id not in stale_ids:
-            continue
-        artists_text = parts[1] if len(parts) > 1 else title
-        label   = _get_mix_label(artists_text)
-        summary = _get_mix_summary(artists_text)
-        if label or summary:
-            with _db_lock, sqlite3.connect(_SEARCH_CACHE_DB) as conn:
-                conn.execute(
-                    "INSERT OR REPLACE INTO mix_labels (mix_id, label, summary, cached_at) VALUES (?,?,?,?)",
-                    (mix_id, label or "", summary, int(time.time()))
-                )
-            logging.info(f"[mix_labels] {title} → \"{label}\" / \"{summary}\"")
+
+def _refresh_mix_labels_async(mixes_raw=None):
+    threading.Thread(target=_refresh_mix_labels, args=(mixes_raw,), daemon=True,
+                     name="mix-labels-now").start()
 
 
 def _mix_label_loop():
@@ -264,7 +300,7 @@ def _mix_label_loop():
             _refresh_mix_labels()
         except Exception as e:
             logging.warning(f"[mix_labels] refresh-fel: {e}")
-        time.sleep(_MIX_LABEL_TTL)
+        time.sleep(_MIX_CHECK_INTERVAL)
 
 
 def _search_cache_get(query: str, search_type: str, limit: int):
@@ -1456,6 +1492,7 @@ def play_daily():
         return "Error", 404
     lms_play_stream(player_mac, ["spotty", "playlist", "play", f"item_id:playlists.{idx}"])
     _mark_queue_origin(player_mac, "daily_mix")   # Spotify valde spåren — inte 'manual'
+    _refresh_mix_labels_async()   # har mixen bytts syns det när låten börjar
     return f"Playing Daily Mix {idx}"
 
 @app.route('/play_random_album')
@@ -1672,38 +1709,43 @@ def get_random_albums():
 
 @app.route('/get_daily_mixes')
 def get_daily_mixes():
-    # AI-summeringar (samma som knappens label men längre) cachade i mix_labels.
+    # AI-summeringar (samma som knappens label men längre) cachade i mix_labels. En summering
+    # visas bara om den skrevs för mixens NUVARANDE innehåll — annars None (skärmarna faller
+    # tillbaka på description) och en omgörning startas i bakgrunden.
     try:
-        with sqlite3.connect(_SEARCH_CACHE_DB) as conn:
-            ai_summaries = {r[0]: r[1] for r in conn.execute(
-                "SELECT mix_id, summary FROM mix_labels"
-            ).fetchall()}
+        rows = _mix_label_rows()
     except Exception:
-        ai_summaries = {}
+        rows = {}
 
-    mixes = []
-    for item in _fetch_daily_mixes_raw():
+    raw = _fetch_daily_mixes_raw()
+    mixes, changed = [], False
+    for item in raw:
         parts = item.get('text', '').split('\n')
         title = parts[0]
         if not any(x in title for x in ["Mix", "Radar", "Discovery", "daylist"]):
             continue
         raw_id = item.get('params', {}).get('item_id') or item.get('id', '0.0')
         raw_img = item.get('icon') or item.get('image', '')
-        m = re.search(r'/imageproxy/([^/]+)/image', raw_img)
-        image_cdn = urllib.parse.unquote(m.group(1)) if m else (raw_img if raw_img.startswith('http') else '')
         mid = raw_id.split('.')[-1]
-        try:
-            ai_summary = ai_summaries.get(int(mid))
-        except (TypeError, ValueError):
-            ai_summary = None
+        ai_summary, updated = None, None
+        idx = _daily_mix_index(title)
+        if idx is not None:
+            cached = rows.get(idx)
+            if cached and cached[2] == _mix_sig(item):
+                ai_summary, updated = cached[1], cached[3]
+            else:
+                changed = True
         mixes.append({
             'id':          mid,
             'title':       title,
             'description': parts[1] if len(parts) > 1 else "Din personliga mix",
             'ai_summary':  ai_summary or None,
             'art':         _abs_image(raw_img),
-            'image_cdn':   image_cdn,
+            'image_cdn':   _image_cdn(raw_img),
+            'updated':     updated,   # unix-tid då ai_summary skrevs (None = saknas/gammal)
         })
+    if changed:
+        _refresh_mix_labels_async(raw)
     return jsonify(mixes)
 
 
@@ -1782,25 +1824,27 @@ def get_playlist_tracks():
 def get_daily_mixes_knob():
     """Textlista för knappen: title|label|index, en per rad, bara Daily Mix 1-6.
     label är AI-genererad stämningssummering (1-2 ord); fallback på första artisten."""
-    with sqlite3.connect(_SEARCH_CACHE_DB) as conn:
-        cached_labels = {r[0]: r[1] for r in conn.execute(
-            "SELECT mix_id, label FROM mix_labels"
-        ).fetchall()}
+    rows = _mix_label_rows()
 
-    lines = []
-    for item in _fetch_daily_mixes_raw():
+    raw = _fetch_daily_mixes_raw()
+    lines, changed = [], False
+    for item in raw:
         parts = item.get('text', '').split('\n')
         title = parts[0]
-        if not (title.startswith('Daily Mix ') and len(title) == 11 and '1' <= title[10] <= '6'):
+        idx = _daily_mix_index(title)
+        if idx is None:
             continue
-        idx = int(title[10]) - 1
-        if idx in cached_labels:
-            label = cached_labels[idx]
+        cached = rows.get(idx)
+        if cached and cached[0] and cached[2] == _mix_sig(item):
+            label = cached[0]
         else:
+            changed = True
             # Fallback: första artisten ur beskrivningstexten
             desc = parts[1] if len(parts) > 1 else ''
             label = desc.split(',')[0].strip() if desc else title
         lines.append(f"{title}|{label}|{idx}")
+    if changed:
+        _refresh_mix_labels_async(raw)
     return '\n'.join(lines), 200, {'Content-Type': 'text/plain; charset=utf-8'}
 
 _BUTTONS_FILE    = Path(__file__).parent / "buttons.json"
@@ -1825,6 +1869,7 @@ def _run_button_action(action, room: str, player_mac: str):
     elif isinstance(action, dict) and "daily" in action:
         lms_play_stream(player_mac, ["spotty", "playlist", "play", f"item_id:playlists.{int(action['daily'])}"])
         _mark_queue_origin(player_mac, "daily_mix")
+        _refresh_mix_labels_async()
     elif isinstance(action, dict) and "warm" in action:
         # Bästa FÖRVÄRMDA DJ-listan för önskemålet — Edgar svarar direkt, spelar i bakgrunden
         requests.post(f"{EDGAR_URL}/api/warm_button", json={"query": action["warm"], "room": room}, timeout=5)
