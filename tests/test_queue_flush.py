@@ -22,11 +22,13 @@ def at(hour, minute=0, day=29):
 class Player:
     def __init__(self, mode="pause", tracks=12):
         self.mode, self.tracks, self.connected, self.sent = mode, tracks, True, []
+        self.queued_at = at(9)                      # när kön senast ändrades (playlist_timestamp)
 
     def rpc(self, mac, cmd, timeout=3, _raw=False):
         if cmd[0] == "status":
             return {"result": {"mode": self.mode, "time": 40.0, "duration": 240,
                                "playlist_tracks": self.tracks, "playlist_cur_index": 0,
+                               "playlist_timestamp": self.queued_at if self.tracks else None,
                                "playlist_loop": [{"url": "spotify://track:x"}]}}
         if not _raw and lb._is_start_command(cmd):
             lb._last_start_cmd[mac] = lb.time.time()
@@ -111,6 +113,25 @@ class QueueFlushTest(unittest.TestCase):
         lb._last_start_cmd[MAC] = at(12, 29)
         self.tick(at(12, 30))
         self.assertFalse(self.pl.cleared)
+
+    def test_reappear_with_new_queue_from_lyrion_app_is_left(self):
+        # Spelaren slås på och någon väljer musik i Lyrion-appen innan vakthunden sett den:
+        # ingen start via bryggan, men kön är ändrad efter att spelaren försvann.
+        self.tick(at(12))
+        self.pl.connected = False
+        self.tick(at(12, 1))
+        self.pl.connected, self.pl.mode, self.pl.queued_at = True, "play", at(12, 29)
+        self.tick(at(12, 30))
+        self.assertFalse(self.pl.cleared)
+        self.assertNotIn(["stop"], self.pl.sent)
+
+    def test_new_player_since_bridge_start_with_old_queue_is_cleared(self):
+        saved = self.pl.listing
+        self.pl.listing = lambda: []                # bryggan startar, spelaren syns inte
+        self.tick(at(12))
+        self.pl.listing, self.pl.mode = saved, "play"
+        self.tick(at(12, 10))
+        self.assertTrue(self.pl.cleared)
 
     def test_short_blip_is_ignored(self):
         self.tick(at(12))

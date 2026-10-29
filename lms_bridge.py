@@ -357,7 +357,7 @@ _LOCK_SKIP_MAX      = int(os.getenv("BRIDGE_LOCK_SKIP_MAX", "2"))           # ma
 # tillbaka efter att ha varit borta (då nådde kvällsrensningen den inte).
 _NIGHT_FLUSH_HOUR   = int(os.getenv("BRIDGE_NIGHT_FLUSH_HOUR", "23"))
 _REAPPEAR_AFTER_S   = int(os.getenv("BRIDGE_REAPPEAR_AFTER_S", "600"))      # borta minst så länge
-_OWN_START_GRACE_S  = 120   # en start via bryggan så nyss → återkomsten spelar för att någon valt det
+_OWN_START_GRACE_S  = 120   # kön ändrad / start via bryggan så nyss → ett val, inte en gammal kö
 _WATCHDOG_POLL      = int(os.getenv("BRIDGE_WATCHDOG_POLL", "10"))          # kollintervall
 # Framsteg kräver att elapsed ökat minst så här mycket sedan förra varvet (ett spelande
 # spår ökar ~_WATCHDOG_POLL s). 12 okt 2026: efter en låt som tagit slut kröp Lyrions
@@ -1014,17 +1014,18 @@ def _flush_queue(p, r, event, why, now):
 
 def _on_reappear(p, r, away_s, now):
     """En spelare som varit borta har kopplat upp sig igen. Lyrion kan då återuppta den gamla
-    kön, så den rensas, utom när den spelar för att någon nyss startat den via bryggan."""
+    kön, så den rensas, utom när kön är ett nytt val: Lyrions playlist_timestamp (när kön
+    senast ändrades) ligger efter att spelaren försvann, oavsett varifrån valet kom (Lyrion-
+    appen, :9000, Spotify Connect). En start via bryggan räknas också som ett val."""
     mac = p.get('playerid')
     if int(_num(r.get('playlist_tracks'))) <= 0:
         return
+    since = now - away_s if away_s is not None else now - _OWN_START_GRACE_S
+    if _num(r.get('playlist_timestamp')) >= since or now - _last_start_cmd.get(mac, 0) < _OWN_START_GRACE_S:
+        return
     away = f"borta {away_s / 60:.0f} min" if away_s is not None else "ny sedan bryggan startade"
-    if r.get('mode') == 'play':
-        if now - _last_start_cmd.get(mac, 0) < _OWN_START_GRACE_S:
-            return
-        _flush_queue(p, r, "reappear", f"tillbaka ({away}) och spelar utan att någon startat den", now)
-    else:
-        _flush_queue(p, r, "reappear", f"tillbaka ({away}), läge {r.get('mode')!r}", now)
+    how = "spelar den gamla kön av sig själv" if r.get('mode') == 'play' else f"läge {r.get('mode')!r}"
+    _flush_queue(p, r, "reappear", f"tillbaka ({away}), {how}", now)
 
 
 def _night_flush(players, statuses, now):
