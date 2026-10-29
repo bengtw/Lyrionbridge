@@ -8,6 +8,7 @@ import threading
 import requests
 import random
 import time
+import datetime
 import urllib.parse
 from pathlib import Path
 import volume_cal
@@ -341,14 +342,22 @@ _ACTIVE_PLAYERS_CACHE_TTL = 5
 # bara det som inte kommer framåt. Två trösklar beroende på läge:
 #   - LÅS (mode 'play' men fryst): först hopp till nästa spår efter ~30 s (max 2 hopp,
 #     en hängd Spotty-start ska inte kosta hela kön), sedan stop + rensa kö efter ~1 min.
-#   - PAUS/STOPP (mode != 'play'): kan vara medveten paus → vänta 1 h innan kö
-#     rensas, så inget spontant återupptas men en avsiktlig paus hinner återupptas.
+#   - PAUS/STOPP (mode != 'play'): rörs inte under dagen. Kl 23 rensas varje kö som inte
+#     spelar (_NIGHT_FLUSH_HOUR), och en spelare som varit borta minst _REAPPEAR_AFTER_S
+#     rensas när den dyker upp igen (_on_reappear). Se _night_flush.
 # Play-tid-kicken i _deferred_kick hanterar separat strömmar som aldrig startade.
 # Allt konfigurerbart via .env.
 _LOCK_KILL_SECONDS  = int(os.getenv("BRIDGE_LOCK_KILL_SECONDS", "60"))      # lås-tröskel
 _LOCK_SKIP_SECONDS  = int(os.getenv("BRIDGE_LOCK_SKIP_SECONDS", "30"))      # lås: hoppa till nästa spår efter Ns
 _LOCK_SKIP_MAX      = int(os.getenv("BRIDGE_LOCK_SKIP_MAX", "2"))           # max hopp innan stop + rensa
-_IDLE_FLUSH_SECONDS = int(os.getenv("BRIDGE_IDLE_FLUSH_SECONDS", "3600"))   # paus/stopp-tröskel
+# Köer som inte spelar (29 okt 2026, ersätter "rensa efter 1 h paus/stopp"): Lyrion kan
+# återuppta en gammal kö när en spelare kopplar upp sig igen eller slås på (badrummet 10 jun
+# 2026: en 20 dagar gammal kö startade av sig själv). Timregeln tömde också ~3 köer om dagen
+# efter vanliga pauser. Nu: rensa allt som inte spelar kl 23, och en spelare som kommer
+# tillbaka efter att ha varit borta (då nådde kvällsrensningen den inte).
+_NIGHT_FLUSH_HOUR   = int(os.getenv("BRIDGE_NIGHT_FLUSH_HOUR", "23"))
+_REAPPEAR_AFTER_S   = int(os.getenv("BRIDGE_REAPPEAR_AFTER_S", "600"))      # borta minst så länge
+_OWN_START_GRACE_S  = 120   # en start via bryggan så nyss → återkomsten spelar för att någon valt det
 _WATCHDOG_POLL      = int(os.getenv("BRIDGE_WATCHDOG_POLL", "10"))          # kollintervall
 # Framsteg kräver att elapsed ökat minst så här mycket sedan förra varvet (ett spelande
 # spår ökar ~_WATCHDOG_POLL s). 12 okt 2026: efter en låt som tagit slut kröp Lyrions
@@ -389,6 +398,11 @@ _c5_desync_since = None  # när LMS-spelar-men-C5-STOPPED började (skuggläge)
 _c5_woken_at     = 0.0   # senaste väckning (en start = flera kommandon → väck en gång)
 _last_mode      = {}   # mac → senast sedda mode (paus/stopp → play = färsk frist)
 _skip_recover   = {}   # mac → antal spårhopp vakthunden gjort mot ett lås (nollställs vid framsteg)
+_gone_since     = {}   # mac → när spelaren senast försvann ur Lyrions lista (eller blev bortkopplad)
+_present        = set()  # spelare som var anslutna förra varvet
+_last_start_cmd = {}   # mac → senaste startkommando via bryggan (lms_json_rpc)
+_night_flushed  = None   # datum för senaste kvällsrensning
+_watchdog_started = False  # första varvet gjort (spelare som syns då är inte "tillbaka")
 
 
 # --- HJÄLPFUNKTIONER ---
@@ -482,6 +496,8 @@ def lms_json_rpc(player_id, command_args, timeout=3, _raw=False):
     """JSON-RPC mot LMS. Startkommandon till C5 går genom C5-spärren: väckning
     vid kallstart FÖRE kommandot, startkontroll EFTER — oavsett vilken väg
     (Edgar, dashboard, transfer …) som startade. `_raw` = C5-logikens egna kommandon."""
+    if not _raw and player_id and _is_start_command(command_args):
+        _last_start_cmd[player_id] = time.time()
     c5_start = (not _raw and player_id == C5_MAC and _is_start_command(command_args))
     if c5_start:
         c5_wake(player_id)
@@ -872,7 +888,7 @@ def _init_lock_events():
                     player          TEXT,
                     mac             TEXT,
                     model           TEXT,
-                    event           TEXT,     -- 'lock' (fryst play) | 'idle' (paus/stopp)
+                    event           TEXT,     -- 'lock' | 'skip' | 'shadow' | 'night' (kl 23) | 'reappear' | 'idle' (före 29 okt)
                     mode            TEXT,
                     froze_at        REAL,     -- elapsed-tid där den fastnade (0 = startade aldrig)
                     frozen_for      INTEGER,  -- sekunder utan framsteg innan vi dödade
@@ -978,22 +994,87 @@ def _num(v, default=0.0) -> float:
         return default
 
 
-def _watchdog_tick():
-    """Ett varv: döda spelare som inte kommer framåt. Lås (mode 'play' men fryst)
-    rensas efter _LOCK_KILL_SECONDS, paus/stopp efter _IDLE_FLUSH_SECONDS. Ingen
-    återupplivning. Anropas av _watchdog_loop var _WATCHDOG_POLL:e sekund."""
-    global _c5_last_playing
-    now = time.time()
-    seen = set()
-    for p in get_all_players():
+def _forget_player_state(mac):
+    for d in (_last_elapsed, _last_track, _skip_recover, _trusted_pos):
+        d.pop(mac, None)
+
+
+def _flush_queue(p, r, event, why, now):
+    """Stop + rensa kön. Klockan nollställs så att spelaren får färsk frist efteråt."""
+    mac = p.get('playerid')
+    logging.info(f"[watchdog] {p.get('name', mac)} ({mac}) {why}, "
+                 f"{int(_num(r.get('playlist_tracks')))} spår — rensar kö + stop")
+    _record_lock_event(p, r, event=event, froze_at=_num(r.get('time')),
+                       frozen_for=int(now - _last_active_ts.get(mac, now)))
+    lms_json_rpc(mac, ["stop"])
+    lms_json_rpc(mac, ["playlist", "clear"])
+    _last_active_ts[mac] = now
+    _forget_player_state(mac)
+
+
+def _on_reappear(p, r, away_s, now):
+    """En spelare som varit borta har kopplat upp sig igen. Lyrion kan då återuppta den gamla
+    kön, så den rensas, utom när den spelar för att någon nyss startat den via bryggan."""
+    mac = p.get('playerid')
+    if int(_num(r.get('playlist_tracks'))) <= 0:
+        return
+    away = f"borta {away_s / 60:.0f} min" if away_s is not None else "ny sedan bryggan startade"
+    if r.get('mode') == 'play':
+        if now - _last_start_cmd.get(mac, 0) < _OWN_START_GRACE_S:
+            return
+        _flush_queue(p, r, "reappear", f"tillbaka ({away}) och spelar utan att någon startat den", now)
+    else:
+        _flush_queue(p, r, "reappear", f"tillbaka ({away}), läge {r.get('mode')!r}", now)
+
+
+def _night_flush(players, statuses, now):
+    """Kl _NIGHT_FLUSH_HOUR: rensa varje kö som inte spelar, så att inget väcks till liv i natt.
+    Bortkopplade spelare som Lyrion fortfarande listar får också sin kö rensad."""
+    n = 0
+    for p in players:
         mac = p.get('playerid')
         if not mac:
+            continue
+        if mac in statuses:
+            r = statuses[mac]
+            if r.get('mode') == 'play' or int(_num(r.get('playlist_tracks'))) <= 0:
+                continue
+            _flush_queue(p, r, "night", f"kvällsrensning (läge {r.get('mode')!r})", now)
+        else:
+            logging.info(f"[watchdog] kvällsrensning: {p.get('name', mac)} bortkopplad — rensar kön")
+            lms_json_rpc(mac, ["playlist", "clear"])
+        n += 1
+    logging.info(f"[watchdog] kvällsrensning klar: {n} köer rensade")
+
+
+def _watchdog_tick():
+    """Ett varv: döda spelare som inte kommer framåt (lås: mode 'play' men fryst, efter
+    _LOCK_KILL_SECONDS), rensa köer som inte spelar kl _NIGHT_FLUSH_HOUR och spelare som
+    kommer tillbaka efter att ha varit borta. Ingen återupplivning. Anropas av
+    _watchdog_loop var _WATCHDOG_POLL:e sekund."""
+    global _c5_last_playing, _night_flushed, _present, _watchdog_started
+    now = time.time()
+    seen = set()
+    statuses = {}
+    players = get_all_players()
+    for p in players:
+        mac = p.get('playerid')
+        if not mac or str(p.get('connected', 1)) == '0':
             continue
         seen.add(mac)
         res = lms_json_rpc(mac, ["status", "-", 1, "tags:ud"])
         if not res or 'result' not in res:
             continue
         r = res['result']
+        statuses[mac] = r
+        if mac not in _present:
+            gone = _gone_since.pop(mac, None)
+            if gone is not None and now - gone >= _REAPPEAR_AFTER_S:
+                _on_reappear(p, r, now - gone, now)
+                continue
+            if gone is None and _watchdog_started:
+                _on_reappear(p, r, None, now)       # ny spelare sedan bryggan startade
+                continue
         mode = r.get('mode')
         playlist_tracks = int(_num(r.get('playlist_tracks')))
         elapsed = _num(r.get('time'))
@@ -1080,8 +1161,10 @@ def _watchdog_tick():
 
         frozen_for = now - baseline
         # Lås (rapporterar 'play' men står still) är en trasig ström → döda snabbt.
-        # Paus/stopp kan vara medvetet → ge en timme innan kön rensas.
+        # Paus/stopp rörs inte här — se _night_flush och _on_reappear.
         is_lock = mode == 'play'
+        if not is_lock:
+            continue
 
         # C5: LMS-klockan står still, men det betyder inget förrän C5 själv bekräftar.
         # Säger C5 PLAYING spelar den — rör inget och starta om frysklockan. Annars
@@ -1134,26 +1217,20 @@ def _watchdog_tick():
                 _last_active_ts[mac] = now
                 continue
 
-        threshold = _LOCK_KILL_SECONDS if is_lock else _IDLE_FLUSH_SECONDS
+        if frozen_for >= _LOCK_KILL_SECONDS:
+            _flush_queue(p, r, "lock", f"låst ström i {int(frozen_for)}s", now)
 
-        if frozen_for >= threshold:
-            reason = "låst ström" if is_lock else f"inaktiv (mode={mode!r})"
-            logging.info(
-                f"[watchdog] {name} ({mac}) {reason} i {int(frozen_for)}s, "
-                f"{playlist_tracks} spår — rensar kö + stop"
-            )
-            _record_lock_event(
-                p, r,
-                event="lock" if is_lock else "idle",
-                froze_at=elapsed, frozen_for=int(frozen_for),
-            )
-            lms_json_rpc(mac, ["stop"])
-            lms_json_rpc(mac, ["playlist", "clear"])
-            _last_active_ts[mac] = now   # nollställ klockan efter åtgärd
-            _last_elapsed.pop(mac, None)
-            _last_track.pop(mac, None)
-            _skip_recover.pop(mac, None)
-            _trusted_pos.pop(mac, None)
+    # Kvällsrensning en gång per dygn (även om bryggan startar efter klockslaget).
+    today = datetime.datetime.fromtimestamp(now)
+    if today.hour >= _NIGHT_FLUSH_HOUR and _night_flushed != today.date():
+        _night_flushed = today.date()
+        _night_flush(players, statuses, now)
+    _watchdog_started = True
+
+    # Spelare som försvunnit: notera när, så att återkomsten kan rensas.
+    for mac in _present - seen:
+        _gone_since.setdefault(mac, now)
+    _present = seen
 
     # Glöm spelare som försvunnit (avstängda) så dictarna inte växer obegränsat.
     for mac in list(_last_active_ts.keys()):

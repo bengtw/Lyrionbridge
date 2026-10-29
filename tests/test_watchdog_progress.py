@@ -35,6 +35,7 @@ class WatchdogProgressTest(unittest.TestCase):
         for d in (lb._last_active_ts, lb._last_elapsed, lb._last_track, lb._last_mode, lb._skip_recover,
                   lb._trusted_pos, lb._jump_seen, lb._false_end_logged, lb._shadow_since):
             d.clear()
+        lb._gone_since.clear(); lb._present = set(); lb._watchdog_started = False
         p = mock.patch.object(lb, "_SHADOW_MACS", set())
         p.start(); self.addCleanup(p.stop)
 
