@@ -712,13 +712,21 @@ def get_all_players():
     global _player_cache, _player_cache_time
     if _player_cache and _cache_valid(_player_cache_time, _PLAYER_CACHE_TTL):
         return _player_cache
-    res = lms_json_rpc("", ["players", "0", "10"])
+    res = lms_json_rpc("", ["players", "0", "50"])
     if res and 'result' in res:
         players = res['result'].get('players_loop', [])
         if players:
             _player_cache = players
             _player_cache_time = time.time()
     return _player_cache
+
+def _is_phone(mac):
+    """Är spelaren Edgar-appen i en telefon? Känns igen på modellnamnet, se volume_cal."""
+    mac = str(mac or "").lower()
+    for p in get_all_players():
+        if p.get('playerid', '').lower() == mac:
+            return volume_cal.is_phone(p.get('modelname'))
+    return False
 
 def _any_player_mac():
     """Returnerar MAC-adressen för första tillgängliga spelare."""
@@ -2077,13 +2085,27 @@ def transfer_playback():
     # (volume_cal, uppmätt på gehör 12 okt 2026), och mottagarrummet kan stå högt
     # sedan sist — sätts nivån efteråt hinner det smälla till. Omätta rum ger None
     # och lämnas i fred. Här, i bryggan, eftersom ALLA flyttar passerar den här vägen.
-    tgt_vol = volume_cal.equivalent_volume(from_mac, to_mac, r.get('mixer volume'))
+    # Telefonen (Edgar-appen) spelar på 100 och styrs av telefonens systemvolym — dess
+    # volym får aldrig räknas om till ett rum. Se volume_cal.transfer_volume.
+    from_phone = _is_phone(from_mac)
+    to_phone   = _is_phone(to_mac)
+    to_cur = None
+    if from_phone:
+        cur = lms_json_rpc(to_mac, ["mixer", "volume", "?"])
+        try:
+            to_cur = cur['result']['_volume']
+        except (KeyError, TypeError):
+            pass
+    tgt_vol = volume_cal.transfer_volume(from_mac, to_mac, r.get('mixer volume'), to_cur,
+                                         from_is_phone=from_phone, to_is_phone=to_phone)
 
     if to_mac == C5_MAC:
         lms_json_rpc(to_mac, ["power", 1])
     if tgt_vol is not None:
         _set_player_volume(to_mac, tgt_vol)     # sätter även C5:ans egen volym
-        logging.info(f"[transfer] volym {r.get('mixer volume')} → {tgt_vol} ({from_mac} → {to_mac})")
+        logging.info(f"[transfer] volym {r.get('mixer volume')} → {tgt_vol} ({from_mac} → {to_mac}"
+                     f"{', från telefonen, mål stod på ' + str(to_cur) if from_phone else ''}"
+                     f"{', till telefonen' if to_phone else ''})")
     elif to_mac == C5_MAC:
         set_c5_volume_upnp(20)                  # gammalt beteende när rummet saknar mätning
     if to_mac == C5_MAC:

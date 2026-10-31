@@ -95,3 +95,53 @@ def equivalent_volume(from_mac, to_mac, volume):
     ref = _interpolate(vol, pts_from)
     back = [(r, v) for v, r in pts_to]          # referens → rummets egen skala
     return int(round(_interpolate(ref, back)))
+
+
+# ── Telefonen (Edgar-appen på iPhone, 31 okt 2026) ───────────────────────────
+# I telefonen spelar Lyrion på 100 och ljudstyrkan sköts helt av telefonens
+# systemvolym. Telefonens 100 säger alltså INGENTING om hur starkt det låter, och
+# får aldrig räknas om till ett rum: telefon → kontoret skulle annars ge full volym.
+# Spelaren känns igen på modellnamnet (appen sätter det), inte på MAC: MAC:en är
+# lokalt genererad (02:…) och kan bytas vid ominstallation, och simulatorn är en egen.
+PHONE_MODELNAMES = {"edgar iphone"}
+PHONE_VOLUME = 100
+
+# Tak när musiken kommer FRÅN telefonen, i referensskalan: 38 är den mellersta
+# uppmätta nivån (kök 38, vardagsrum 35, kontor 21). Taket bara SÄNKER — står
+# rummet lägre sedan sist lämnas det i fred. Omätta rum kläms på sin egen skala.
+PHONE_HANDOVER_REF_MAX = 38
+PHONE_HANDOVER_RAW_MAX = 30
+
+
+def is_phone(modelname) -> bool:
+    return str(modelname or "").strip().lower() in PHONE_MODELNAMES
+
+
+def phone_handover_ceiling(to_mac) -> int:
+    """Högsta volym i `to_mac` när musiken kommer från telefonen."""
+    pts = CALIBRATION.get(str(to_mac).lower())
+    if not pts:
+        return PHONE_HANDOVER_RAW_MAX
+    back = [(r, v) for v, r in pts]
+    return int(round(_interpolate(PHONE_HANDOVER_REF_MAX, back)))
+
+
+def transfer_volume(from_mac, to_mac, from_volume, to_volume,
+                    from_is_phone=False, to_is_phone=False):
+    """Volymen att sätta i `to_mac` före en flytt, eller None = lämna i fred.
+
+    - Till telefonen: alltid PHONE_VOLUME — telefonens systemvolym tar över.
+    - Från telefonen: källans volym ignoreras; målrummet kläms till taket
+      (sänks bara, höjs aldrig). Okänd nuvarande volym ger taket.
+    - Mellan rum: den kalibrerade omräkningen (None för omätta rum).
+    """
+    if to_is_phone:
+        return PHONE_VOLUME
+    if from_is_phone:
+        ceiling = phone_handover_ceiling(to_mac)
+        try:
+            current = float(to_volume)
+        except (TypeError, ValueError):
+            return ceiling
+        return ceiling if current > ceiling else None
+    return equivalent_volume(from_mac, to_mac, from_volume)

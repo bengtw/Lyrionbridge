@@ -72,3 +72,46 @@ class VolumeCalTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+TEL = "02:ad:55:48:89:b9"
+
+
+class PhoneTransferTest(unittest.TestCase):
+    """Telefonen spelar på 100 och styrs av systemvolymen (31 okt 2026)."""
+
+    def flytt(self, fran, till, fran_vol, till_vol, fp=False, tp=False):
+        return volume_cal.transfer_volume(fran, till, fran_vol, till_vol,
+                                          from_is_phone=fp, to_is_phone=tp)
+
+    def test_modellnamnet_kanns_igen(self):
+        self.assertTrue(volume_cal.is_phone("Edgar iPhone"))
+        self.assertFalse(volume_cal.is_phone("SqueezeLite-pCP"))
+        self.assertFalse(volume_cal.is_phone(None))
+
+    def test_telefonens_100_ger_aldrig_full_volym(self):
+        """Hem till kontoret: kontoret får aldrig gå till 100."""
+        for till in (KONT, KOK, VARD, BAD):
+            v = self.flytt(TEL, till, 100, 100, fp=True)
+            self.assertIsNotNone(v)
+            self.assertLessEqual(v, 38)
+
+    def test_taket_foljer_kalibreringen(self):
+        self.assertEqual(volume_cal.phone_handover_ceiling(KONT), 21)
+        self.assertEqual(volume_cal.phone_handover_ceiling(KOK), 38)
+        self.assertEqual(volume_cal.phone_handover_ceiling(VARD), 35)
+        self.assertEqual(volume_cal.phone_handover_ceiling(BAD), 30)
+
+    def test_lagre_mal_lamnas_i_fred(self):
+        """Taket sänker bara — stod kontoret på 15 sedan sist höjs det inte."""
+        self.assertIsNone(self.flytt(TEL, KONT, 100, 15, fp=True))
+
+    def test_okand_malvolym_ger_taket(self):
+        self.assertEqual(self.flytt(TEL, KONT, 100, None, fp=True), 21)
+
+    def test_till_telefonen_alltid_100(self):
+        self.assertEqual(self.flytt(KONT, TEL, 21, 40, tp=True), 100)
+
+    def test_mellan_rum_som_forut(self):
+        self.assertEqual(self.flytt(KOK, KONT, 38, 50), 21)
+        self.assertIsNone(self.flytt(KOK, BAD, 38, 50))
